@@ -1,0 +1,7 @@
+{
+  "pythonPath": "../.venv/Scripts/python.exe",
+  "venvPath": "..",
+  "venv": ".venv",
+  "include": ["src", "tests"],
+  "extraPaths": ["src"]
+}
