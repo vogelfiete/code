@@ -3,7 +3,25 @@ Print a sparse adjacency matrix for the top-N most-confident unique proteins
 found in a crosslink CSV file.
 
 Usage:
-    python scripts/print_matrix.py <csv_path> [--n 100]
+    python scripts/print_matrix.py <csv_path> [options]
+
+Options:
+    --n INT           Number of unique proteins to display (default 1000)
+    --order MODE      Axis ordering — one of:
+                        confidence  (default) highest-scoring proteins first
+                        alpha       alphabetical
+                        cluster     hierarchical clustering by crosslink scores
+                        sequence    hierarchical clustering by k-mer similarity
+                        pathway     group by KEGG pathway (requires --species)
+                        complex     group by STRING complex/pathway (requires --species)
+    --fasta PATH      FASTA file (required for --order sequence)
+    --species INT     NCBI taxonomy ID for pathway/complex ordering (default 9606 = human)
+
+Examples:
+    python scripts/print_matrix.py data/links.csv
+    python scripts/print_matrix.py data/links.csv --n 200 --order alpha
+    python scripts/print_matrix.py data/links.csv --order sequence --fasta data/proteins.fasta
+    python scripts/print_matrix.py data/links.csv --order pathway --species 9913
 """
 from __future__ import annotations
 
