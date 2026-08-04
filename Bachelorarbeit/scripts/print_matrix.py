@@ -260,6 +260,11 @@ def _apply_order(
         from fetch_group_order import order_by_string
         return order_by_string(group, species)
 
+    if mode == "size":
+        def _size_key(p: str) -> int:
+            return -len(sequences[p]) if sequences and p in sequences else 1
+        return sorted(group, key=_size_key), None
+
     return group, None  # fallback
 
 
@@ -485,10 +490,11 @@ def main() -> None:
                         help=f"Number of unique proteins (default {DEFAULT_N})")
     parser.add_argument("--order",
                         choices=["confidence", "alpha", "cluster", "sequence",
-                                 "pathway", "complex"],
+                                 "pathway", "complex", "size"],
                         default="confidence",
                         help="Axis ordering: confidence (default), alpha, cluster, "
-                             "sequence, pathway (KEGG), complex (STRING)")
+                             "sequence, pathway (KEGG), complex (STRING), "
+                             "size (longest sequence first)")
     parser.add_argument("--fasta", default=None,
                         help="FASTA file path (required for --order sequence)")
     parser.add_argument("--species", type=int, default=9606,

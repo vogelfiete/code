@@ -28,7 +28,6 @@ _RENDERER_LABEL = "pygame SDL2 (GPU)" if _pygame is not None else "numpy (CPU)"
 
 try:
     import matplotlib.cm as _mpl_cm
-    import matplotlib.pyplot as _mpl_plt
     _MPL = True
 except Exception:
     _MPL = False
@@ -68,7 +67,7 @@ _BG_PG  = (255, 255, 255)
 _FG_PG  = (0, 0, 0)
 _SEP_PG = (153, 153, 153)
 _HL            = (0, 120, 215)   # highlight — PIL and pygame share the same RGB
-_CONTOUR_COLOR = (200, 0, 0)     # dark-red contour isoline color
+
 
 _MONO_FONTS = [
     "C:/Windows/Fonts/consola.ttf",
@@ -124,14 +123,20 @@ def _make_lut(cmap_name: str) -> np.ndarray:
 
 
 def _score_to_bg(
-    score: float, min_s: float, max_s: float, lut: np.ndarray
+    score: float,
+    min_s: float,
+    max_s: float,
+    lut: np.ndarray,
+    score_sorted: np.ndarray | None = None,
 ) -> tuple[int, int, int]:
     """Map a score to an RGB background colour via LUT lookup."""
-    if max_s <= min_s:
+    if score_sorted is not None and len(score_sorted) > 0:
+        idx = int(np.searchsorted(score_sorted, score) / len(score_sorted) * 255)
+    elif max_s <= min_s:
         idx = 128
     else:
         idx = int((score - min_s) / (max_s - min_s) * 255)
-        idx = max(0, min(255, idx))
+    idx = max(0, min(255, idx))
     r, g, b = lut[idx]
     return int(r), int(g), int(b)
 
@@ -141,38 +146,6 @@ def _auto_fg(bg_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
     return (0, 0, 0) if lum > 128 else (255, 255, 255)
 
-
-def _compute_contour_segs(
-    proteins: list[str],
-    sparse: dict[tuple[str, str], float],
-    split: int,
-    n_levels: int,
-) -> list[list[tuple[float, float]]]:
-    """
-    Return isoline polylines in fractional cell-index space (0..n-1).
-    Coordinates are zoom/scroll-independent — multiply by cell_px at draw time.
-    """
-    if not _MPL or not proteins:
-        return []
-    n = len(proteins)
-    grid = np.zeros((n, n), dtype=np.float32)
-    for ri, pi in enumerate(proteins):
-        for ci, pj in enumerate(proteins):
-            v = sparse.get((min(pi, pj), max(pi, pj)))
-            if v is not None:
-                grid[ri, ci] = v
-    try:
-        fig, ax = _mpl_plt.subplots()
-        cs = ax.contour(np.arange(n), np.arange(n), grid, levels=n_levels)
-        segs: list[list[tuple[float, float]]] = []
-        for collection in cs.collections:
-            for path in collection.get_paths():
-                verts = path.vertices
-                segs.append([(float(v[0]), float(v[1])) for v in verts])
-        _mpl_plt.close(fig)
-        return segs
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +177,14 @@ class MatrixApp(tk.Tk):
         self._cmap_lut: np.ndarray | None = None  # None = disabled
         self._min_score: float = 0.0
         self._max_score: float = 1.0
+        self._score_sorted: np.ndarray = np.array([])
+        self._norm_mode: str = "linear"
 
-        # Contour overlay
-        self._contour_segs: list[list[tuple[float, float]]] = []
-        # _contour_enabled and _contour_levels are tk.Var, created in _build_controls
+        # UniProt lookup cache and stale-click guard
+        self._uniprot_cache: dict[str, tuple[str, int]] = {}
+        self._sel_token: int = 0
+
+        # _norm_var is tk.Var, created in _build_controls
 
         # Tkinter fonts (for geometry only — not used for drawing)
         self._lf: tkfont.Font | None = None
@@ -267,7 +244,7 @@ class MatrixApp(tk.Tk):
         self._order_var = tk.StringVar(value="confidence")
         ttk.Combobox(
             row2, textvariable=self._order_var, width=12, state="readonly",
-            values=["confidence", "alpha", "cluster", "sequence", "pathway", "complex"],
+            values=["confidence", "alpha", "cluster", "sequence", "pathway", "complex", "size"],
         ).pack(side=tk.LEFT, padx=2)
         tk.Label(row2, text="  Species:").pack(side=tk.LEFT)
         self._species_var = tk.StringVar(value="9606")
@@ -282,28 +259,21 @@ class MatrixApp(tk.Tk):
         row3.pack(fill=tk.X, padx=4, pady=(2, 0))
         tk.Label(row3, text="Colormap:").pack(side=tk.LEFT)
         self._cmap_var = tk.StringVar(value="(none)")
-        _cmap_choices = (
-            ["(none)", "viridis", "plasma", "inferno", "magma", "cividis", "coolwarm", "RdYlGn"]
-            if _MPL else ["(none)"]
-        )
+        _cmap_choices = (["(none)", "coolwarm"] if _MPL else ["(none)"])
         ttk.Combobox(
             row3, textvariable=self._cmap_var, width=10,
             state="readonly", values=_cmap_choices,
         ).pack(side=tk.LEFT, padx=2)
         self._cmap_var.trace_add("write", lambda *_: self._on_colormap_change())
 
-        tk.Label(row3, text="   Contours:").pack(side=tk.LEFT)
-        self._contour_enabled = tk.BooleanVar(value=False)
-        self._contour_levels = tk.IntVar(value=5)
-        tk.Checkbutton(
-            row3, text="Show", variable=self._contour_enabled,
-            command=self._on_contour_change,
-        ).pack(side=tk.LEFT)
-        tk.Label(row3, text="Levels:").pack(side=tk.LEFT, padx=(6, 0))
-        tk.Spinbox(
-            row3, textvariable=self._contour_levels, from_=2, to=20,
-            width=4, command=self._on_contour_change,
-        ).pack(side=tk.LEFT, padx=2)
+        tk.Label(row3, text="   Norm:").pack(side=tk.LEFT)
+        self._norm_var = tk.StringVar(value="linear")
+        for _lbl, _val in [("Linear", "linear"), ("Quantile", "quantile")]:
+            tk.Radiobutton(
+                row3, text=_lbl, variable=self._norm_var, value=_val,
+                command=self._on_norm_change,
+            ).pack(side=tk.LEFT)
+
         if not _MPL:
             tk.Label(row3, text="(matplotlib not available)", fg="red").pack(side=tk.LEFT, padx=4)
 
@@ -511,20 +481,79 @@ class MatrixApp(tk.Tk):
 
     def _on_cell_select(self, row: int, col: int) -> None:
         self._selected = (row, col)
+        self._sel_token += 1
+        token = self._sel_token
         pi = self._proteins[row]
         pj = self._proteins[col]
         key = (min(pi, pj), max(pi, pj))
         score = self._sparse.get(key)
-        di = "decoy" if self._decoy.get(pi) else "target"
-        dj = "decoy" if self._decoy.get(pj) else "target"
-        if score is not None:
+        score_line = f"score: {score:.4f}" if score is not None else "(no crosslink)"
+
+        def _fmt_local(p: str) -> str:
+            tag = "decoy" if self._decoy.get(p) else "target"
+            aa = f"{len(self._seqs[p])} aa" if p in self._seqs else "fetching…"
+            sec = (self._section.get(p, "") if self._section else "")
+            sec_part = f"  [{sec}]" if sec else ""
+            return f"{p}  ({aa}, {tag}){sec_part}"
+
+        self._sel_info_var.set(f"{_fmt_local(pi)}\n{_fmt_local(pj)}\n{score_line}")
+        threading.Thread(
+            target=self._fetch_uniprot_info, args=(pi, pj, token), daemon=True
+        ).start()
+
+    def _fetch_uniprot_info(self, pi: str, pj: str, token: int) -> None:
+        import urllib.request
+        import json as _json
+
+        def _acc(name: str) -> str:
+            if "|" in name:
+                return name.split("|")[1].strip()
+            return name.split()[0].strip()
+
+        def _fetch(accession: str) -> tuple[str, int] | None:
+            if accession in self._uniprot_cache:
+                return self._uniprot_cache[accession]
+            url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = _json.loads(resp.read().decode())
+                name = (data.get("proteinDescription", {})
+                            .get("recommendedName", {})
+                            .get("fullName", {})
+                            .get("value", accession))
+                length = int(data.get("sequence", {}).get("length", 0))
+                result: tuple[str, int] = (name, length)
+                self._uniprot_cache[accession] = result
+                return result
+            except Exception:
+                return None
+
+        acc_i = _acc(pi)
+        acc_j = _acc(pj)
+        ri = _fetch(acc_i)
+        rj = _fetch(acc_j)
+
+        def _update() -> None:
+            if self._sel_token != token:
+                return
+            key = (min(pi, pj), max(pi, pj))
+            score = self._sparse.get(key)
+            score_line = f"score: {score:.4f}" if score is not None else "(no crosslink)"
+
+            def _line(p: str, acc: str, r: tuple[str, int] | None) -> str:
+                tag = "decoy" if self._decoy.get(p) else "target"
+                sec = (self._section.get(p, "") if self._section else "")
+                sec_part = f"  [{sec}]" if sec else ""
+                if r:
+                    return f"{r[0]}  ({r[1]} aa, {tag}){sec_part}  [{acc}]"
+                return f"{p}  (?, {tag}){sec_part}"
+
             self._sel_info_var.set(
-                f"{pi}  ×  {pj}    score: {score:.2f}    {di} – {dj}"
+                f"{_line(pi, acc_i, ri)}\n{_line(pj, acc_j, rj)}\n{score_line}"
             )
-        else:
-            self._sel_info_var.set(
-                f"{pi}  ×  {pj}    no link    {di} – {dj}"
-            )
+
+        self.after(0, _update)
 
     def _clear_selection(self) -> None:
         self._selected = None
@@ -576,7 +605,7 @@ class MatrixApp(tk.Tk):
                 proteins, sparse, decoy = build_matrix(csv, n=n)
                 seqs = read_fasta(fasta) if fasta else None
                 proteins, section = _sort_proteins(proteins, sparse, decoy, order, seqs, species)
-                self.after(0, lambda: self._on_loaded(proteins, sparse, decoy, section))
+                self.after(0, lambda: self._on_loaded(proteins, sparse, decoy, section, seqs))
             except Exception as exc:
                 msg = str(exc)
                 self.after(0, lambda: self._on_error(msg))
@@ -594,13 +623,10 @@ class MatrixApp(tk.Tk):
             self._pg_score_cache = {}
         self._schedule()
 
-    def _on_contour_change(self) -> None:
-        if self._contour_enabled.get() and self._proteins:
-            self._contour_segs = _compute_contour_segs(
-                self._proteins, self._sparse, self._split, self._contour_levels.get()
-            )
-        else:
-            self._contour_segs = []
+    def _on_norm_change(self) -> None:
+        self._norm_mode = self._norm_var.get()
+        if hasattr(self, "_pg_score_cache"):
+            self._pg_score_cache = {}
         self._schedule()
 
     def _on_loaded(
@@ -609,25 +635,22 @@ class MatrixApp(tk.Tk):
         sparse: dict[tuple[str, str], float],
         decoy: dict[str, bool],
         section: dict[str, str] | None,
+        seqs: dict[str, str] | None = None,
     ) -> None:
         self._proteins = proteins
         self._sparse = sparse
         self._decoy = decoy
         self._section = section
+        self._seqs: dict[str, str] = seqs or {}
         self._thresholds = _build_thresholds(sparse) if sparse else []
         self._split = next(
             (i for i, p in enumerate(proteins) if decoy.get(p, False)), len(proteins)
         )
         self._min_score = min(sparse.values()) if sparse else 0.0
         self._max_score = max(sparse.values()) if sparse else 1.0
+        self._score_sorted = np.sort(list(sparse.values())) if sparse else np.array([])
         if self._cmap_lut is not None:
             self._cmap_lut = _make_lut(self._cmap_name)
-        if self._contour_enabled.get():
-            self._contour_segs = _compute_contour_segs(
-                proteins, sparse, self._split, self._contour_levels.get()
-            )
-        else:
-            self._contour_segs = []
         n_t = self._split
         n_d = len(proteins) - n_t
         self._status_var.set(f"Loaded — {n_t} targets · {n_d} decoys · {len(sparse)} links")
@@ -752,25 +775,28 @@ class MatrixApp(tk.Tk):
                 score = sparse.get((min(pi, pj), max(pi, pj)))
                 if score is None:
                     continue
-                label = _cell_label(score, cp, thresholds)
                 if cmap_lut is not None:
-                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut)
+                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
+                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
                     x0c, y0c = lw + ci * cp, hh + ri * cp
                     draw.rectangle([x0c, y0c, x0c + cp - 1, y0c + cp - 1], fill=bg)
-                    draw.text(
-                        (x0c + cp // 2, y0c + cp // 2),
-                        label, font=font_cell, anchor="mm", fill=_auto_fg(bg),
-                    )
-                else:
-                    draw.text(
-                        (lw + ci * cp + cp // 2, hh + ri * cp + cp // 2),
-                        label, font=font_cell, anchor="mm", fill=_FG,
-                    )
-
-        for polyline in self._contour_segs:
-            pts = [(lw + int(x * cp), hh + int(y * cp)) for x, y in polyline]
-            if len(pts) >= 2:
-                draw.line(pts, fill=_CONTOUR_COLOR, width=1)
+                    if cp >= SCORE_THRESHOLD_PX:
+                        draw.text(
+                            (x0c + cp // 2, y0c + cp // 2),
+                            f"{score:.2f}", font=font_cell, anchor="mm", fill=_auto_fg(bg),
+                        )
+                else:  # greyscale default — no dot symbols
+                    mn, mx = self._min_score, self._max_score
+                    grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
+                    grey_val = max(40, min(200, grey_val))
+                    bg = (grey_val, grey_val, grey_val)
+                    x0c, y0c = lw + ci * cp, hh + ri * cp
+                    draw.rectangle([x0c, y0c, x0c + cp - 1, y0c + cp - 1], fill=bg)
+                    if cp >= SCORE_THRESHOLD_PX:
+                        draw.text(
+                            (x0c + cp // 2, y0c + cp // 2),
+                            f"{score:.2f}", font=font_cell, anchor="mm", fill=_auto_fg(bg),
+                        )
 
         return img
 
@@ -845,40 +871,41 @@ class MatrixApp(tk.Tk):
                     score: Optional[float] = sparse.get((min(pi, pj), max(pi, pj)))
                     if score is None:
                         continue
-                    label = _cell_label(score, cp, thresholds)
                     if cmap_lut is not None:
-                        bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut)
-                        fg = _auto_fg(bg)
-                        cache_key = (label, fg, bg)
-                        glyph = score_cache.get(cache_key)
-                        if glyph is None:
-                            np_glyph = atlas_np_pg.get(label)
-                            if np_glyph is not None:
-                                # Colorize numpy glyph: white→bg, black→fg
-                                mask = (np_glyph[:, :, 0] > 200)[:, :, np.newaxis]
-                                colored = np.where(mask, bg, fg).astype(np.uint8)
-                                cell_surf = _pygame.surfarray.make_surface(np.swapaxes(colored, 0, 1))
-                            else:
-                                # ASCII score string — safe to render with pg_font
-                                text_surf = pg_font.render(label, True, fg, bg)
-                                cell_surf = _pygame.Surface((cp, cp))
-                                cell_surf.fill(bg)
-                                cell_surf.blit(text_surf, text_surf.get_rect(center=(cp // 2, cp // 2)))
-                            score_cache[cache_key] = glyph = cell_surf
-                        screen.blit(glyph, (ci * cp - ox, row_y))
-                    else:
-                        glyph = atlas.get(label)
-                        if glyph is None:
-                            glyph = score_cache.get(label)
-                            if glyph is None:
-                                text_surf = pg_font.render(label, True, _FG_PG, _BG_PG)
-                                cell_surf = _pygame.Surface((cp, cp))
-                                cell_surf.fill(_BG_PG)
-                                r = text_surf.get_rect(center=(cp // 2, cp // 2))
-                                cell_surf.blit(text_surf, r)
-                                glyph = cell_surf
-                                score_cache[label] = glyph
-                        screen.blit(glyph, (ci * cp - ox, row_y))
+                        bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
+                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
+                        bg_col = (int(bg[0]), int(bg[1]), int(bg[2]))
+                        show_text = cp >= SCORE_THRESHOLD_PX
+                        score_str = f"{score:.2f}" if show_text else ""
+                        cache_key = ("cm", bg_col, score_str)
+                        cell_surf = score_cache.get(cache_key)
+                        if cell_surf is None:
+                            cell_surf = _pygame.Surface((cp, cp))
+                            cell_surf.fill(bg_col)
+                            if show_text:
+                                fg_col = _auto_fg(bg_col)
+                                ts = pg_font.render(score_str, True, fg_col, bg_col)
+                                cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
+                            score_cache[cache_key] = cell_surf
+                        screen.blit(cell_surf, (ci * cp - ox, row_y))
+                    else:  # greyscale default — no dot symbols
+                        mn, mx = self._min_score, self._max_score
+                        grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
+                        grey_val = max(40, min(200, grey_val))
+                        bg_col = (grey_val, grey_val, grey_val)
+                        show_text = cp >= SCORE_THRESHOLD_PX
+                        score_str = f"{score:.2f}" if show_text else ""
+                        cache_key = ("gs", grey_val, score_str)
+                        cell_surf = score_cache.get(cache_key)
+                        if cell_surf is None:
+                            cell_surf = _pygame.Surface((cp, cp))
+                            cell_surf.fill(bg_col)
+                            if show_text:
+                                fg_col = _auto_fg(bg_col)
+                                ts = pg_font.render(score_str, True, fg_col, bg_col)
+                                cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
+                            score_cache[cache_key] = cell_surf
+                        screen.blit(cell_surf, (ci * cp - ox, row_y))
 
             if has_sep:
                 sx = split * cp - ox
@@ -894,12 +921,6 @@ class MatrixApp(tk.Tk):
                 hy = sel_r * cp - oy
                 lw = max(2, cp // 8)
                 _pygame.draw.rect(screen, _HL, (hx, hy, cp, cp), lw)
-
-            # Contour overlay
-            for polyline in self._contour_segs:
-                pts = [(int(x * cp - ox), int(y * cp - oy)) for x, y in polyline]
-                if len(pts) >= 2:
-                    _pygame.draw.lines(screen, _CONTOUR_COLOR, False, pts, 1)
 
             # Process click events before flip
             for ev in _pygame.event.get():
@@ -930,39 +951,29 @@ class MatrixApp(tk.Tk):
                 score = sparse.get((min(pi, pj), max(pi, pj)))
                 if score is None:
                     continue
-                label = _cell_label(score, cp, thresholds)
                 col_x = ci * cp - ox
                 if cmap_lut is not None:
-                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut)
-                    fg = _auto_fg(bg)
-                    glyph = atlas_np.get(label)
+                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
+                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
                     iy0 = max(0, row_y); iy1 = min(h, row_y + cp)
                     ix0 = max(0, col_x); ix1 = min(w, col_x + cp)
                     if iy1 > iy0 and ix1 > ix0:
-                        if glyph is not None:
-                            # Colorize numpy glyph: white→bg, black→fg
-                            gy0 = max(0, -row_y); gx0 = max(0, -col_x)
-                            gy1 = gy0 + (iy1 - iy0); gx1 = gx0 + (ix1 - ix0)
-                            sl = glyph[gy0:gy1, gx0:gx1]
-                            mask = (sl[:, :, 0] > 200)[:, :, np.newaxis]
-                            arr[iy0:iy1, ix0:ix1] = np.where(mask, bg, fg).astype(np.uint8)
-                        else:
-                            arr[iy0:iy1, ix0:ix1] = bg
-                            score_texts.append((col_x + cp // 2, row_y + cp // 2, label, fg))
-                else:
-                    glyph = atlas_np.get(label)
-                    if glyph is not None:
-                        gy0 = max(0, -row_y);  iy0 = max(0, row_y)
-                        gx0 = max(0, -col_x);  ix0 = max(0, col_x)
-                        gy1 = min(cp, h - row_y); iy1 = iy0 + (gy1 - gy0)
-                        gx1 = min(cp, w - col_x); ix1 = ix0 + (gx1 - gx0)
-                        if gy1 > gy0 and gx1 > gx0:
-                            arr[iy0:iy1, ix0:ix1] = glyph[gy0:gy1, gx0:gx1]
-                    else:
-                        cx = col_x + cp // 2
-                        cy = row_y + cp // 2
-                        if 0 <= cx <= w and 0 <= cy <= h:
-                            score_texts.append((cx, cy, label))
+                        arr[iy0:iy1, ix0:ix1] = bg
+                        if cp >= SCORE_THRESHOLD_PX:
+                            score_texts.append((col_x + cp // 2, row_y + cp // 2,
+                                                f"{score:.2f}", _auto_fg(bg)))
+                else:  # greyscale default — no dot symbols
+                    mn, mx = self._min_score, self._max_score
+                    grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
+                    grey_val = max(40, min(200, grey_val))
+                    bg = (grey_val, grey_val, grey_val)
+                    iy0 = max(0, row_y); iy1 = min(h, row_y + cp)
+                    ix0 = max(0, col_x); ix1 = min(w, col_x + cp)
+                    if iy1 > iy0 and ix1 > ix0:
+                        arr[iy0:iy1, ix0:ix1] = bg
+                        if cp >= SCORE_THRESHOLD_PX:
+                            score_texts.append((col_x + cp // 2, row_y + cp // 2,
+                                                f"{score:.2f}", _auto_fg(bg)))
 
         img = Image.fromarray(arr)
         draw = ImageDraw.Draw(img)
@@ -984,11 +995,6 @@ class MatrixApp(tk.Tk):
             hy = sel_r * cp - oy
             lw = max(2, cp // 8)
             draw.rectangle([hx, hy, hx + cp - 1, hy + cp - 1], outline=_HL, width=lw)
-
-        for polyline in self._contour_segs:
-            pts = [(int(x * cp - ox), int(y * cp - oy)) for x, y in polyline]
-            if len(pts) >= 2:
-                draw.line(pts, fill=_CONTOUR_COLOR, width=1)
 
         self._mx_photo = ImageTk.PhotoImage(img)
         c.delete("all")
