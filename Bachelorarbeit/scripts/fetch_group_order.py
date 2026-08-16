@@ -1,14 +1,7 @@
-"""
-Fetch biological groupings from KEGG (pathways) or STRING DB (complexes) and
-return a reordered protein list so that proteins sharing the same pathway or
-complex appear adjacent, together with a per-protein section label dict.
-
-Public API (consumed by print_matrix.py):
-    order_by_kegg(proteins, species_code)    -> tuple[list[str], dict[str, str]]
-    order_by_string(proteins, species_taxid) -> tuple[list[str], dict[str, str]]
-
-Both functions return (ordered_proteins, {protein: section_label}).
-"""
+"""Fetch biological groupings from KEGG (pathways) or STRING DB (complexes) and
+return a reordered protein list so proteins sharing a pathway or complex end up
+next to each other, along with a per-protein section label. Used by print_matrix.py
+via order_by_kegg() and order_by_string()."""
 from __future__ import annotations
 
 import json
@@ -19,10 +12,6 @@ import urllib.request
 import warnings
 from pathlib import Path
 from typing import Optional
-
-# ---------------------------------------------------------------------------
-# Cache directory
-# ---------------------------------------------------------------------------
 
 _CACHE_ROOT = Path.home() / ".cache" / "xlms_matrix"
 
@@ -45,10 +34,6 @@ def _save_cache(path: Path, data: dict) -> None:
         json.dump(data, f)
 
 
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
 def _get(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -62,10 +47,6 @@ def _post(url: str, data: dict) -> list:
         return json.loads(resp.read().decode("utf-8"))
 
 
-# ---------------------------------------------------------------------------
-# Protein name normalisation
-# ---------------------------------------------------------------------------
-
 def _parse_identifier(name: str) -> str:
     """
     Strip XL-MS protein names to a bare identifier for database queries.
@@ -73,17 +54,13 @@ def _parse_identifier(name: str) -> str:
     P12345                     ->  P12345
     PROT_HUMAN                 ->  PROT_HUMAN
     """
-    # Handle 'sp|ACC|ENTRY desc' or 'tr|ACC|ENTRY desc'
+    # UniProt FASTA headers look like 'sp|ACC|ENTRY desc' or 'tr|ACC|ENTRY desc'
     if "|" in name:
         parts = name.split("|")
         if len(parts) >= 2:
             return parts[1].strip()
     return name.split()[0].strip()
 
-
-# ---------------------------------------------------------------------------
-# Co-membership matrix → hierarchical clustering → leaf order
-# ---------------------------------------------------------------------------
 
 def _cluster_by_memberships(
     group: list[str],
@@ -117,10 +94,6 @@ def _cluster_by_memberships(
     order = leaves_list(Z)
     return [present[i] for i in order] + absent
 
-
-# ---------------------------------------------------------------------------
-# KEGG
-# ---------------------------------------------------------------------------
 
 _NCBI_TO_KEGG: dict[int, str] = {
     9606:  "hsa",   # Homo sapiens
@@ -302,10 +275,6 @@ def order_by_kegg(proteins: list[str], species: int = 9606) -> tuple[list[str], 
     return ordered, assignment
 
 
-# ---------------------------------------------------------------------------
-# STRING DB
-# ---------------------------------------------------------------------------
-
 _STRING_BASE = "https://string-db.org/api/json"
 _STRING_COMPLEX_CATEGORIES = {"CORUM", "PPI_hub_proteins", "KEGG_Pathways"}
 
@@ -350,7 +319,6 @@ def order_by_string(proteins: list[str], species: int = 9606) -> tuple[list[str]
     cache: dict[str, list[str]] = _load_cache(cache_file) or {}
     term_names: dict[str, str]  = _load_cache(names_cache_file) or {}
 
-    # Resolve only proteins not already cached
     identifiers = [_parse_identifier(p) for p in proteins]
     id_map = dict(zip(proteins, identifiers))  # protein -> bare identifier
     to_resolve = [p for p in proteins if id_map[p] not in cache]
@@ -363,7 +331,6 @@ def order_by_string(proteins: list[str], species: int = 9606) -> tuple[list[str]
             enrichment = _string_fetch_enrichment(list(string_ids_map.values()), species)
             time.sleep(1)
 
-            # Build: string_id -> set of complex/pathway terms; collect display names
             string_memberships: dict[str, set[str]] = {sid: set() for sid in string_ids_map.values()}
             for record in enrichment:
                 if record.get("category") in _STRING_COMPLEX_CATEGORIES:
@@ -376,7 +343,6 @@ def order_by_string(proteins: list[str], species: int = 9606) -> tuple[list[str]
                             if sid.endswith(gene) or gene in sid:
                                 string_memberships[sid].add(term)
 
-            # Store in cache keyed by bare identifier
             for protein in to_resolve:
                 bare = id_map[protein]
                 if bare in string_ids_map:
