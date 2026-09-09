@@ -1,6 +1,7 @@
 """GUI matrix viewer for XL-MS crosslink data. See docs/usage.md for details."""
 from __future__ import annotations
 
+import math
 import os
 import sys
 import threading
@@ -51,6 +52,12 @@ CELL_PX_MIN = 4
 CELL_PX_MAX = 32
 CELL_PX_DEFAULT = 10
 SCORE_THRESHOLD_PX = 18  # cell_px at which scores replace dot symbols
+
+BLOCK_ZOOM_STEPS = 20     # extra slider ticks reserved for block aggregation, below CELL_PX_MIN
+BLOCK_ZOOM_GROWTH = 1.3   # per-tick multiplicative growth of block size (log-zoom feel)
+BLOCK_SIZE_MAX = 500      # hard safety cap regardless of the formula above
+_AGG_METHOD_LABELS = ["Mean", "Geometric Mean", "Max Score"]
+_AGG_METHOD_MAP = {"Mean": "mean", "Geometric Mean": "geomean", "Max Score": "max"}
 
 LABEL_FONT_SIZE = 9
 SEP_COLOR = "#999999"
@@ -160,6 +167,19 @@ class MatrixApp(tk.Tk):
         self._cell_px: int = CELL_PX_DEFAULT
         self._pending: bool = False
         self._selected: tuple[int, int] | None = None
+
+        # Aggregate-zoom / blocks — self._blocks is a drop-in replacement for
+        # self._proteins in geometry code; at block_size==1 it's just
+        # [(0,1),(1,2),...], so geometry math stays pixel-identical to before
+        self._block_size: int = 1
+        self._blocks: list[tuple[int, int]] = []
+        self._item_to_block: list[int] = []
+        self._split_block: int = 0
+        self._item_index: dict = {}
+        self._agg_method: str = "mean"
+        self._block_pair_raw: dict[tuple[int, int], list[float]] = {}
+        self._block_scores: dict[tuple[int, int], float] = {}
+        self._block_pair_n: dict[tuple[int, int], int] = {}
 
         # Heatmap colormap
         self._cmap_name: str = "viridis"
@@ -324,12 +344,23 @@ class MatrixApp(tk.Tk):
         row1.pack(fill=tk.X)
         tk.Label(row1, text="Zoom:").pack(side=tk.LEFT, padx=(4, 0))
         self._zoom = tk.Scale(
-            row1, from_=CELL_PX_MIN, to=CELL_PX_MAX,
-            orient=tk.HORIZONTAL, length=180, showvalue=True,
+            row1, from_=CELL_PX_MIN - BLOCK_ZOOM_STEPS, to=CELL_PX_MAX,
+            orient=tk.HORIZONTAL, length=200, showvalue=False,
             command=self._on_zoom,
         )
         self._zoom.set(CELL_PX_DEFAULT)
         self._zoom.pack(side=tk.LEFT, padx=4)
+        self._zoom_label_var = tk.StringVar(value=f"{CELL_PX_DEFAULT}px")
+        tk.Label(row1, textvariable=self._zoom_label_var, width=14, anchor="w").pack(side=tk.LEFT)
+
+        tk.Label(row1, text="  Aggregate:").pack(side=tk.LEFT, padx=(8, 0))
+        self._agg_method_var = tk.StringVar(value=_AGG_METHOD_LABELS[0])
+        ttk.Combobox(
+            row1, textvariable=self._agg_method_var, width=13, state="readonly",
+            values=_AGG_METHOD_LABELS,
+        ).pack(side=tk.LEFT, padx=2)
+        self._agg_method_var.trace_add("write", lambda *_: self._on_agg_method_change())
+
         self._info_var = tk.StringVar(value="")
         tk.Label(row1, textvariable=self._info_var, fg="gray").pack(side=tk.LEFT, padx=8)
         tk.Label(row1, text=f"renderer: {_RENDERER_LABEL}", fg="#aaaaaa").pack(side=tk.RIGHT, padx=8)
@@ -411,7 +442,7 @@ class MatrixApp(tk.Tk):
         self._ch_canvas.configure(height=hh)
 
     def _virtual(self) -> tuple[int, int]:
-        s = len(self._proteins) * self._cell_px
+        s = len(self._blocks) * self._cell_px
         return s, s
 
     def _update_scrollregion(self) -> None:
@@ -446,22 +477,113 @@ class MatrixApp(tk.Tk):
         self._schedule(fast=True)
 
     def _on_zoom(self, value: str) -> None:
-        self._cell_px = int(float(value))
+        v = int(float(value))
+        if v >= CELL_PX_MIN:
+            self._cell_px = v
+            new_block_size = 1
+            self._zoom_label_var.set(f"{v}px")
+        else:
+            self._cell_px = CELL_PX_MIN
+            steps = CELL_PX_MIN - v
+            new_block_size = min(BLOCK_SIZE_MAX, max(2, round(BLOCK_ZOOM_GROWTH ** steps)))
+            self._zoom_label_var.set(f"≤{new_block_size} → {CELL_PX_MIN}px")
         self._update_cell_font()
+        if new_block_size != self._block_size:
+            self._block_size = new_block_size
+            self._recompute_blocks()
+            if hasattr(self, "_pg_score_cache"):
+                self._pg_score_cache = {}
         self._update_scrollregion()
         self._schedule()
 
+    def _on_agg_method_change(self) -> None:
+        self._agg_method = _AGG_METHOD_MAP.get(self._agg_method_var.get(), "mean")
+        self._reduce_block_scores()
+        if hasattr(self, "_pg_score_cache"):
+            self._pg_score_cache = {}
+        self._schedule()
+
+    def _recompute_blocks(self) -> None:
+        n = len(self._proteins)
+        proteins, section, split, bs = self._proteins, self._section, self._split, self._block_size
+        if n == 0:
+            self._blocks, self._item_to_block, self._split_block = [], [], 0
+        else:
+            if bs <= 1:
+                blocks = [(i, i + 1) for i in range(n)]
+            else:
+                has_sep = 0 < split < n
+                blocks = []
+                i = 0
+                while i < n:
+                    sec0 = section.get(proteins[i], "") if section is not None else None
+                    limit = min(n, i + bs)
+                    j = i + 1
+                    while j < limit:
+                        if has_sep and j == split:
+                            break
+                        if section is not None and section.get(proteins[j], "") != sec0:
+                            break
+                        j += 1
+                    blocks.append((i, j))
+                    i = j
+            item_to_block = [0] * n
+            for bi, (s, e) in enumerate(blocks):
+                item_to_block[s:e] = [bi] * (e - s)
+            self._blocks = blocks
+            self._item_to_block = item_to_block
+            self._split_block = item_to_block[split] if 0 <= split < n else len(blocks)
+        self._recompute_block_buckets()
+        self._reduce_block_scores()
+
+    def _recompute_block_buckets(self) -> None:
+        buckets: dict[tuple[int, int], list[float]] = {}
+        if self._block_size > 1 and self._blocks:
+            item_to_block, idx = self._item_to_block, self._item_index
+            for (pi, pj), score in self._sparse.items():
+                bi, bj = idx.get(pi), idx.get(pj)
+                if bi is None or bj is None:
+                    continue  # defensive; sparse keys are always in self._proteins
+                bi, bj = item_to_block[bi], item_to_block[bj]
+                key = (bi, bj) if bi <= bj else (bj, bi)
+                buckets.setdefault(key, []).append(score)
+        self._block_pair_raw = buckets
+
+    def _reduce_block_scores(self) -> None:
+        method = self._agg_method
+        scores: dict[tuple[int, int], float] = {}
+        counts: dict[tuple[int, int], int] = {}
+        for key, vals in self._block_pair_raw.items():
+            counts[key] = len(vals)
+            if method == "max":
+                scores[key] = max(vals)
+            elif method == "geomean":
+                pos = [v for v in vals if v > 0]
+                if pos:
+                    scores[key] = math.exp(sum(math.log(v) for v in pos) / len(pos))
+                else:
+                    # No positive scores contribute to this block-pair. Geometric
+                    # mean is undefined for non-positive inputs; fall back to the
+                    # arithmetic mean rather than dropping the pair (which would
+                    # wrongly render as "no crosslink" and hide real data).
+                    scores[key] = sum(vals) / len(vals)
+            else:  # "mean"
+                scores[key] = sum(vals) / len(vals)
+        self._block_scores = scores
+        self._block_pair_n = counts
+
     def _on_click(self, event: tk.Event) -> None:
         """Handle left-click on the matrix canvas (numpy path fallback)."""
-        if not self._proteins:
+        if not self._proteins or not self._blocks:
             return
         ox = int(self._mx.canvasx(0))
         oy = int(self._mx.canvasy(0))
-        col = (event.x + ox) // self._cell_px
-        row = (event.y + oy) // self._cell_px
-        n = len(self._proteins)
-        if 0 <= row < n and 0 <= col < n:
-            self._on_cell_select(row, col)
+        cp = self._cell_px
+        cb = (event.x + ox) // cp
+        rb = (event.y + oy) // cp
+        n = len(self._blocks)
+        if 0 <= rb < n and 0 <= cb < n:
+            self._on_block_select(rb, cb)
         else:
             self._selected = None
             self._sel_info_var.set("")
@@ -494,33 +616,33 @@ class MatrixApp(tk.Tk):
             target=self._fetch_uniprot_info, args=(pi, pj, token), daemon=True
         ).start()
 
-    def _fetch_uniprot_info(self, pi, pj, token: int) -> None:
+    def _fetch_uniprot_accession(self, accession: str) -> tuple[str, int] | None:
         import urllib.request
         import json as _json
 
-        def _fetch(accession: str) -> tuple[str, int] | None:
-            if accession in self._uniprot_cache:
-                return self._uniprot_cache[accession]
-            url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = _json.loads(resp.read().decode())
-                name = (data.get("proteinDescription", {})
-                            .get("recommendedName", {})
-                            .get("fullName", {})
-                            .get("value", accession))
-                length = int(data.get("sequence", {}).get("length", 0))
-                result: tuple[str, int] = (name, length)
-                self._uniprot_cache[accession] = result
-                return result
-            except Exception:
-                return None
+        if accession in self._uniprot_cache:
+            return self._uniprot_cache[accession]
+        url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read().decode())
+            name = (data.get("proteinDescription", {})
+                        .get("recommendedName", {})
+                        .get("fullName", {})
+                        .get("value", accession))
+            length = int(data.get("sequence", {}).get("length", 0))
+            result: tuple[str, int] = (name, length)
+            self._uniprot_cache[accession] = result
+            return result
+        except Exception:
+            return None
 
+    def _fetch_uniprot_info(self, pi, pj, token: int) -> None:
         acc_i = _short_accession(self._item_protein(pi))
         acc_j = _short_accession(self._item_protein(pj))
-        ri = _fetch(acc_i)
-        rj = _fetch(acc_j)
+        ri = self._fetch_uniprot_accession(acc_i)
+        rj = self._fetch_uniprot_accession(acc_j)
 
         def _update() -> None:
             if self._sel_token != token:
@@ -540,6 +662,86 @@ class MatrixApp(tk.Tk):
 
             self._sel_info_var.set(
                 f"{_line(pi, acc_i, ri)}\n{_line(pj, acc_j, rj)}\n{score_line}"
+            )
+
+        self.after(0, _update)
+
+    def _agg_method_label(self) -> str:
+        return {"mean": "Mean", "geomean": "Geometric mean", "max": "Max"}.get(self._agg_method, "Mean")
+
+    def _block_score_line(self, rb: int, cb: int) -> str:
+        key = (rb, cb) if rb <= cb else (cb, rb)
+        score = self._block_scores.get(key)
+        if score is None:
+            return "(no crosslinks between these blocks)"
+        n_pairs = self._block_pair_n.get(key, 0)
+        return f"{self._agg_method_label()} of {n_pairs} crosslink(s): {score:.4f}"
+
+    def _on_block_select(self, rb: int, cb: int) -> None:
+        self._selected = (rb, cb)
+        r_lo, r_hi = self._blocks[rb]
+        c_lo, c_hi = self._blocks[cb]
+        if r_hi - r_lo == 1 and c_hi - c_lo == 1:
+            self._on_cell_select(r_lo, c_lo)
+            return
+
+        self._sel_token += 1
+        token = self._sel_token
+        row_items = self._proteins[r_lo:r_hi]
+        col_items = self._proteins[c_lo:c_hi]
+        score_line = self._block_score_line(rb, cb)
+
+        def _fmt_block(items) -> str:
+            decoys = {self._decoy.get(it, False) for it in items}
+            tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
+            secs = {self._section.get(it, "") for it in items} if self._section else set()
+            sec = next(iter(secs)) if len(secs) == 1 else None
+            sec_part = f"  [{sec}]" if sec else ""
+            return f"{len(items)} items ({tag}){sec_part}"
+
+        self._sel_info_var.set(f"{_fmt_block(row_items)}\n{_fmt_block(col_items)}\n{score_line}")
+
+        row_proteins = {self._item_protein(it) for it in row_items}
+        col_proteins = {self._item_protein(it) for it in col_items}
+        if len(row_proteins) == 1 and len(col_proteins) == 1:
+            threading.Thread(
+                target=self._fetch_uniprot_info_block,
+                args=(row_items, col_items, token),
+                daemon=True,
+            ).start()
+
+    def _fetch_uniprot_info_block(self, row_items: list, col_items: list, token: int) -> None:
+        acc_i = _short_accession(self._item_protein(row_items[0]))
+        acc_j = _short_accession(self._item_protein(col_items[0]))
+        ri = self._fetch_uniprot_accession(acc_i)
+        rj = self._fetch_uniprot_accession(acc_j)
+
+        def _pos_range(items: list) -> str:
+            if self._level != "residue":
+                return ""
+            positions = sorted(it.pos for it in items)
+            if len(positions) == 1:
+                return f"  pos {positions[0]}"
+            return f"  pos {positions[0]}-{positions[-1]}"
+
+        def _update() -> None:
+            if self._sel_token != token or self._selected is None:
+                return
+            rb, cb = self._selected
+            score_line = self._block_score_line(rb, cb)
+
+            def _line(items: list, acc: str, r: tuple[str, int] | None) -> str:
+                decoys = {self._decoy.get(it, False) for it in items}
+                tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
+                sec = self._section.get(items[0], "") if self._section else ""
+                sec_part = f"  [{sec}]" if sec else ""
+                pos_part = _pos_range(items)
+                if r:
+                    return f"{r[0]}  ({r[1]} aa, {tag}){sec_part}{pos_part}  [{acc}]"
+                return f"{len(items)} items  (?, {tag}){sec_part}"
+
+            self._sel_info_var.set(
+                f"{_line(row_items, acc_i, ri)}\n{_line(col_items, acc_j, rj)}\n{score_line}"
             )
 
         self.after(0, _update)
@@ -655,6 +857,8 @@ class MatrixApp(tk.Tk):
         self._score_sorted = np.sort(list(sparse.values())) if sparse else np.array([])
         if self._cmap_lut is not None:
             self._cmap_lut = _make_lut(self._cmap_name)
+        self._item_index = {p: i for i, p in enumerate(proteins)}
+        self._recompute_blocks()
         n_t = self._split
         n_d = len(proteins) - n_t
         unit = "residues" if level == "residue" else "proteins"
@@ -799,15 +1003,15 @@ class MatrixApp(tk.Tk):
 
         return img
 
-    def _visible_cols(self) -> tuple[int, int]:
-        n = len(self._proteins)
+    def _visible_col_blocks(self) -> tuple[int, int]:
+        n = len(self._blocks)
         cp = self._cell_px
         x0 = self._mx.canvasx(0)
         x1 = self._mx.canvasx(self._mx.winfo_width())
         return max(0, int(x0 // cp)), min(n, int(x1 // cp) + 1)
 
-    def _visible_rows(self) -> tuple[int, int]:
-        n = len(self._proteins)
+    def _visible_row_blocks(self) -> tuple[int, int]:
+        n = len(self._blocks)
         cp = self._cell_px
         y0 = self._mx.canvasy(0)
         y1 = self._mx.canvasy(self._mx.winfo_height())
@@ -829,14 +1033,25 @@ class MatrixApp(tk.Tk):
         oy = int(c.canvasy(0))
 
         cp = self._cell_px
-        n = len(self._proteins)
-        split = self._split
+        n = len(self._blocks)
+        split = self._split_block
         has_sep = 0 < split < n
-        c0, c1 = self._visible_cols()
-        r0, r1 = self._visible_rows()
+        c0, c1 = self._visible_col_blocks()
+        r0, r1 = self._visible_row_blocks()
         proteins = self._proteins
         sparse = self._sparse
         thresholds = self._thresholds
+
+        if self._block_size <= 1:
+            def _score_at(rb: int, cb: int) -> Optional[float]:
+                pi, pj = proteins[rb], proteins[cb]
+                return sparse.get((min(pi, pj), max(pi, pj)))
+        else:
+            block_scores = self._block_scores
+
+            def _score_at(rb: int, cb: int) -> Optional[float]:
+                key = (rb, cb) if rb <= cb else (cb, rb)
+                return block_scores.get(key)
 
         if _pygame is not None and hasattr(self, "_pg_screen"):
             if (w, h) != self._pg_size:
@@ -851,12 +1066,10 @@ class MatrixApp(tk.Tk):
             screen.fill(_BG_PG)
 
             cmap_lut = self._cmap_lut
-            for ri in range(r0, r1):
-                pi = proteins[ri]
-                row_y = ri * cp - oy
-                for ci in range(c0, c1):
-                    pj = proteins[ci]
-                    score: Optional[float] = sparse.get((min(pi, pj), max(pi, pj)))
+            for rb in range(r0, r1):
+                row_y = rb * cp - oy
+                for cb in range(c0, c1):
+                    score: Optional[float] = _score_at(rb, cb)
                     if score is None:
                         continue
                     if cmap_lut is not None:
@@ -875,7 +1088,7 @@ class MatrixApp(tk.Tk):
                                 ts = pg_font.render(score_str, True, fg_col, bg_col)
                                 cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
                             score_cache[cache_key] = cell_surf
-                        screen.blit(cell_surf, (ci * cp - ox, row_y))
+                        screen.blit(cell_surf, (cb * cp - ox, row_y))
                     else:  # greyscale default — no dot symbols
                         mn, mx = self._min_score, self._max_score
                         grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
@@ -893,7 +1106,7 @@ class MatrixApp(tk.Tk):
                                 ts = pg_font.render(score_str, True, fg_col, bg_col)
                                 cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
                             score_cache[cache_key] = cell_surf
-                        screen.blit(cell_surf, (ci * cp - ox, row_y))
+                        screen.blit(cell_surf, (cb * cp - ox, row_y))
 
             if has_sep:
                 sx = split * cp - ox
@@ -916,7 +1129,7 @@ class MatrixApp(tk.Tk):
                     col_c = (ev.pos[0] + ox) // cp
                     row_c = (ev.pos[1] + oy) // cp
                     if 0 <= row_c < n and 0 <= col_c < n:
-                        self.after(0, lambda r=row_c, c_=col_c: self._on_cell_select(r, c_))
+                        self.after(0, lambda r=row_c, c_=col_c: self._on_block_select(r, c_))
                     else:
                         self.after(0, self._clear_selection)
 
@@ -928,15 +1141,13 @@ class MatrixApp(tk.Tk):
         arr = np.full((h, w, 3), 255, dtype=np.uint8)
         score_texts: list[tuple] = []  # (cx, cy, label[, fg])
 
-        for ri in range(r0, r1):
-            pi = proteins[ri]
-            row_y = ri * cp - oy
-            for ci in range(c0, c1):
-                pj = proteins[ci]
-                score = sparse.get((min(pi, pj), max(pi, pj)))
+        for rb in range(r0, r1):
+            row_y = rb * cp - oy
+            for cb in range(c0, c1):
+                score = _score_at(rb, cb)
                 if score is None:
                     continue
-                col_x = ci * cp - ox
+                col_x = cb * cp - ox
                 if cmap_lut is not None:
                     bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
                                       score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
@@ -993,26 +1204,30 @@ class MatrixApp(tk.Tk):
 
         cp = self._cell_px
         lh = self._ch
-        n = len(self._proteins)
-        split = self._split
+        n = len(self._blocks)
+        split = self._split_block
         has_sep = 0 < split < n
-        c0, c1 = self._visible_cols()
+        c0, c1 = self._visible_col_blocks()
         pil_lf = self._pil_lf
+        proteins = self._proteins
+        blocks = self._blocks
 
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
         y = 0
 
-        # Section label row
+        # Section label row — walked over blocks; each block is guaranteed
+        # single-section by construction, so adjacent same-label blocks
+        # still merge into one wide, legible span exactly as before
         if self._section is not None:
             i = 0
             while i < n:
-                label = self._section.get(self._proteins[i], "")
+                label = self._section.get(proteins[blocks[i][0]], "")
                 j = i + 1
                 while j < n:
                     if has_sep and j == split:
                         break
-                    if self._section.get(self._proteins[j], "") != label:
+                    if self._section.get(proteins[blocks[j][0]], "") != label:
                         break
                     j += 1
                 x0s = i * cp - ox
@@ -1029,15 +1244,19 @@ class MatrixApp(tk.Tk):
             sx = split * cp - ox
             draw.line([(sx, 0), (sx, h)], fill=_SEP, width=1)
 
-        # Stacked chars
+        # Stacked chars — only for single-item blocks; a multi-item block's
+        # per-char label would misleadingly suggest the whole block is one item
         labels = self._col_labels
         max_len = max((len(lb) for lb in labels), default=0)
         for char_idx in range(max_len):
-            for ci in range(c0, c1):
-                lb = labels[ci]
+            for cb in range(c0, c1):
+                s, e = blocks[cb]
+                if e - s != 1:
+                    continue
+                lb = labels[s]
                 ch = lb[char_idx] if char_idx < len(lb) else " "
                 if ch != " ":
-                    cx = ci * cp + cp // 2 - ox
+                    cx = cb * cp + cp // 2 - ox
                     draw.text((cx, y + lh // 2), ch, font=pil_lf, anchor="mm", fill=_FG)
             y += lh
 
@@ -1058,20 +1277,29 @@ class MatrixApp(tk.Tk):
         oy = int(c.canvasy(0))
 
         cp = self._cell_px
-        n = len(self._proteins)
-        split = self._split
+        n = len(self._blocks)
+        split = self._split_block
         has_sep = 0 < split < n
-        r0, r1 = self._visible_rows()
+        r0, r1 = self._visible_row_blocks()
         pil_lf = self._pil_lf
         lh = self._ch
+        proteins = self._proteins
+        blocks = self._blocks
 
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
 
-        for ri in range(r0, r1):
-            label = self._row_labels[ri]
-            cy = ri * cp + cp // 2 - oy
-            draw.text((2, cy), label, font=pil_lf, anchor="lm", fill=_FG)
+        for rb in range(r0, r1):
+            s, e = blocks[rb]
+            cy = rb * cp + cp // 2 - oy
+            if e - s == 1:
+                label = self._row_labels[s]
+            elif self._section is not None:
+                label = self._section.get(proteins[s], "")
+            else:
+                label = ""
+            if label:
+                draw.text((2, cy), label, font=pil_lf, anchor="lm", fill=_FG)
 
         if has_sep:
             sy = split * cp - oy
