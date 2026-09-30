@@ -1,6 +1,12 @@
-"""GUI matrix viewer for XL-MS crosslink data. See docs/usage.md for details."""
+"""GUI matrix viewer for XL-MS crosslink data. See docs/usage.md for details.
+
+Data comes from the same pipeline as the CLI (scripts/print_matrix.py). The
+matrix is drawn either through an embedded pygame/SDL2 surface or, without
+pygame, as a numpy/PIL image. Zooming out below CELL_PX_MIN merges
+neighbouring items into blocks whose scores are aggregated."""
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -10,7 +16,7 @@ import tkinter.filedialog as filedialog
 import tkinter.font as tkfont
 import tkinter.messagebox as messagebox
 import tkinter.ttk as ttk
-from typing import Optional
+import urllib.request
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -20,10 +26,8 @@ try:
 except Exception:
     _pygame = None  # type: ignore[assignment]
 
-_RENDERER_LABEL = "pygame SDL2 (GPU)" if _pygame is not None else "numpy (CPU)"
-
 try:
-    import matplotlib.cm as _mpl_cm
+    import matplotlib
     _MPL = True
 except Exception:
     _MPL = False
@@ -33,43 +37,38 @@ sys.path.insert(0, os.path.join(_DIR, "..", "scripts"))
 sys.path.insert(0, os.path.join(_DIR, "..", "src"))
 
 from print_matrix import (  # type: ignore[import]
+    COL_W,
+    DEFAULT_N,
+    ORDER_MODES,
+    ROW_W,
+    add_unlinked_residues,
     build_matrix,
     build_residue_matrix,
-    ResidueId,
-    _sort_proteins,
-    _sort_residues,
-    _add_unlinked_residues,
-    _short_accession,
-    _build_thresholds,
-    _score_to_dot,
-    DEFAULT_N,
-    COL_W,
-    ROW_W,
+    protein_of,
+    short_accession,
+    sort_proteins,
+    sort_residues,
 )
 from xlms.io import read_fasta  # type: ignore[import]
 
 CELL_PX_MIN = 4
 CELL_PX_MAX = 32
 CELL_PX_DEFAULT = 10
-SCORE_THRESHOLD_PX = 18  # cell_px at which scores replace dot symbols
+SCORE_THRESHOLD_PX = 18   # cell_px at which the numeric score is drawn in each cell
 
-BLOCK_ZOOM_STEPS = 20     # extra slider ticks reserved for block aggregation, below CELL_PX_MIN
+BLOCK_ZOOM_STEPS = 20     # extra slider ticks below CELL_PX_MIN, used for block aggregation
 BLOCK_ZOOM_GROWTH = 1.3   # per-tick multiplicative growth of block size (log-zoom feel)
 BLOCK_SIZE_MAX = 500      # hard safety cap regardless of the formula above
-_AGG_METHOD_LABELS = ["Mean", "Geometric Mean", "Max Score"]
-_AGG_METHOD_MAP = {"Mean": "mean", "Geometric Mean": "geomean", "Max Score": "max"}
+_AGG_METHODS = {"Mean": "mean", "Geometric Mean": "geomean", "Max Score": "max"}   # dropdown -> key
+_AGG_NAMES = {"mean": "Mean", "geomean": "Geometric mean", "max": "Max"}          # key -> info text
 
 LABEL_FONT_SIZE = 9
-SEP_COLOR = "#999999"
+SIDEBAR_W = 270           # width of the left control panel, in px
 BG = "white"
-
 _BG = (255, 255, 255)
 _FG = (0, 0, 0)
 _SEP = (153, 153, 153)
-_BG_PG  = (255, 255, 255)
-_FG_PG  = (0, 0, 0)
-_SEP_PG = (153, 153, 153)
-_HL = (0, 120, 215)  # selection highlight, shared between the PIL and pygame paths
+_HL = (0, 120, 215)  # selection highlight
 
 _MONO_FONTS = [
     "C:/Windows/Fonts/consola.ttf",
@@ -77,8 +76,10 @@ _MONO_FONTS = [
     "C:/Windows/Fonts/lucon.ttf",
 ]
 
-_GLYPH_CHARS = [*"·○●⬤", *"0123456789"]
 
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 
 def _find_pil_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     for path in _MONO_FONTS:
@@ -87,35 +88,11 @@ def _find_pil_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
-def _build_glyph_atlas(
-    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
-    cell_px: int,
-) -> dict[str, np.ndarray]:
-    """Pre-render each glyph to a (cell_px, cell_px, 3) uint8 numpy array."""
-    atlas: dict[str, np.ndarray] = {}
-    for ch in _GLYPH_CHARS:
-        g = Image.new("RGB", (cell_px, cell_px), _BG)
-        ImageDraw.Draw(g).text((cell_px // 2, cell_px // 2), ch,
-                               font=font, anchor="mm", fill=_FG)
-        atlas[ch] = np.array(g, dtype=np.uint8)
-    return atlas
-
-
-def _cell_label(score: float, cell_px: int, thresholds: list[float]) -> str:
-    if cell_px >= SCORE_THRESHOLD_PX:
-        return f"{score:.0f}"
-    return _score_to_dot(score, thresholds)
-
-
 def _make_lut(cmap_name: str) -> np.ndarray:
-    """Return a (256, 3) uint8 array mapping [0..255] → RGB for the named colormap."""
+    """(256, 3) uint8 array mapping 0..255 -> RGB for a matplotlib colormap."""
     if not _MPL:
         return np.zeros((256, 3), dtype=np.uint8)
-    try:
-        import matplotlib
-        cmap = matplotlib.colormaps[cmap_name]
-    except (AttributeError, KeyError):
-        cmap = _mpl_cm.get_cmap(cmap_name)  # type: ignore[attr-defined]
+    cmap = matplotlib.colormaps[cmap_name]
     return (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
 
 
@@ -126,196 +103,371 @@ def _score_to_bg(
     lut: np.ndarray,
     score_sorted: np.ndarray | None = None,
 ) -> tuple[int, int, int]:
-    """Map a score to an RGB background colour via LUT lookup."""
+    """Colormap colour for a score: by rank if score_sorted is given
+    (quantile normalisation), else linear between min_s and max_s."""
     if score_sorted is not None and len(score_sorted) > 0:
         idx = int(np.searchsorted(score_sorted, score) / len(score_sorted) * 255)
     elif max_s <= min_s:
         idx = 128
     else:
         idx = int((score - min_s) / (max_s - min_s) * 255)
-    idx = max(0, min(255, idx))
-    r, g, b = lut[idx]
+    r, g, b = lut[max(0, min(255, idx))]
     return int(r), int(g), int(b)
 
 
 def _auto_fg(bg_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
-    """Return black or white for best contrast against bg_rgb (BT.601 luminance)."""
+    """Black or white, whichever contrasts better with bg_rgb (BT.601 luminance)."""
     lum = 0.299 * bg_rgb[0] + 0.587 * bg_rgb[1] + 0.114 * bg_rgb[2]
     return (0, 0, 0) if lum > 128 else (255, 255, 255)
 
+
+def _aggregate(values: list[float], method: str) -> float:
+    if method == "max":
+        return max(values)
+    if method == "geomean":
+        positive = [v for v in values if v > 0]
+        if positive:
+            return math.exp(sum(math.log(v) for v in positive) / len(positive))
+        # Geometric mean is undefined without positive values; fall back to the
+        # arithmetic mean rather than dropping the pair (which would wrongly
+        # render as "no crosslink" and hide real data).
+    return sum(values) / len(values)
+
+
+# --------------------------------------------------------------------------
+# Two-handle range slider
+# --------------------------------------------------------------------------
+
+class RangeSlider(tk.Canvas):
+    """Horizontal slider with two handles that select a [lo, hi] sub-range
+    of [min, max]. command(lo, hi) fires while dragging, release_command(lo, hi)
+    when the mouse button is released."""
+    PAD = 9       # px between canvas edge and track end (room for a handle)
+    HANDLE = 5    # handle half-width in px
+
+    def __init__(self, master, command, release_command, **kw) -> None:
+        kw.setdefault("height", 26)
+        kw.setdefault("highlightthickness", 0)
+        super().__init__(master, **kw)
+        self._command = command
+        self._release_command = release_command
+        self._min, self._max = 0.0, 1.0
+        self._lo, self._hi = 0.0, 1.0
+        self._drag: str | None = None   # "lo", "hi" or None
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def set_bounds(self, lo: float, hi: float) -> None:
+        """Set the full range and move both handles to its ends."""
+        self._min, self._max = lo, hi
+        self._lo, self._hi = lo, hi
+        self._redraw()
+
+    def values(self) -> tuple[float, float]:
+        return self._lo, self._hi
+
+    def _x(self, value: float) -> float:
+        span = self._max - self._min
+        frac = (value - self._min) / span if span > 0 else 0.0
+        return self.PAD + frac * (self.winfo_width() - 2 * self.PAD)
+
+    def _value(self, x: float) -> float:
+        frac = (x - self.PAD) / max(1, self.winfo_width() - 2 * self.PAD)
+        if frac <= 0:
+            return self._min   # exact ends, so the extreme scores stay inclusive
+        if frac >= 1:
+            return self._max
+        return self._min + frac * (self._max - self._min)
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        y = self.winfo_height() // 2
+        xl, xh = self._x(self._lo), self._x(self._hi)
+        self.create_line(self.PAD, y, self.winfo_width() - self.PAD, y, fill="#bbbbbb", width=4)
+        self.create_line(xl, y, xh, y, fill="#1a6fb5", width=4)
+        for x in (xl, xh):
+            self.create_rectangle(x - self.HANDLE, y - 8, x + self.HANDLE, y + 8,
+                                  fill="white", outline="#1a6fb5", width=2)
+
+    def _on_press(self, event: tk.Event) -> None:
+        if self._max <= self._min:
+            return
+        d_lo, d_hi = abs(event.x - self._x(self._lo)), abs(event.x - self._x(self._hi))
+        if d_lo != d_hi:
+            self._drag = "lo" if d_lo < d_hi else "hi"
+        elif self._hi >= self._max:      # handles on top of each other at the right end
+            self._drag = "lo"
+        elif self._lo <= self._min:      # ... at the left end
+            self._drag = "hi"
+        else:
+            self._drag = "lo" if event.x < self._x(self._lo) else "hi"
+        self._on_drag(event)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._drag is None:
+            return
+        value = self._value(event.x)
+        if self._drag == "lo":
+            self._lo = min(value, self._hi)
+        else:
+            self._hi = max(value, self._lo)
+        self._redraw()
+        self._command(self._lo, self._hi)
+
+    def _on_release(self, _event: tk.Event) -> None:
+        if self._drag is not None:
+            self._drag = None
+            self._release_command(self._lo, self._hi)
+
+
+# --------------------------------------------------------------------------
+# Application
+# --------------------------------------------------------------------------
 
 class MatrixApp(tk.Tk):
     def __init__(self, initial_csv: str | None = None) -> None:
         super().__init__()
         self.title("XL-MS Matrix Viewer")
         self.geometry("1200x800")
-        self.minsize(600, 400)
+        self.minsize(700, 450)
 
-        # Data — self._proteins holds either protein names (str) or
-        # ResidueId(protein, pos), depending on self._level
+        # Data — axis items are protein names (str) or ResidueIds, see self._level
         self._level: str = "protein"
         self._proteins: list = []
         self._sparse: dict[tuple, float] = {}
         self._decoy: dict = {}
         self._section: dict | None = None
-        self._thresholds: list[float] = []
-        self._split: int = 0
+        self._seqs: dict[str, str] = {}
+        self._split: int = 0              # index of the first decoy item
         self._col_labels: list[str] = []
         self._row_labels: list[str] = []
+        self._item_index: dict = {}
 
-        # Render state
+        # Blocks — self._blocks replaces self._proteins in all geometry code.
+        # At block_size 1 it is [(0,1), (1,2), ...], i.e. one block per item.
         self._cell_px: int = CELL_PX_DEFAULT
-        self._pending: bool = False
-        self._selected: tuple[int, int] | None = None
-
-        # Aggregate-zoom / blocks — self._blocks is a drop-in replacement for
-        # self._proteins in geometry code; at block_size==1 it's just
-        # [(0,1),(1,2),...], so geometry math stays pixel-identical to before
         self._block_size: int = 1
-        self._blocks: list[tuple[int, int]] = []
+        self._blocks: list[tuple[int, int]] = []    # (start, end) item ranges
         self._item_to_block: list[int] = []
         self._split_block: int = 0
-        self._item_index: dict = {}
         self._agg_method: str = "mean"
         self._block_pair_raw: dict[tuple[int, int], list[float]] = {}
         self._block_scores: dict[tuple[int, int], float] = {}
         self._block_pair_n: dict[tuple[int, int], int] = {}
 
-        # Heatmap colormap
-        self._cmap_name: str = "viridis"
-        self._cmap_lut: np.ndarray | None = None  # None = disabled
+        # Colours
+        self._cmap_name: str = "coolwarm"
+        self._cmap_lut: np.ndarray | None = None   # None = greyscale
+        self._norm_mode: str = "linear"
         self._min_score: float = 0.0
         self._max_score: float = 1.0
         self._score_sorted: np.ndarray = np.array([])
-        self._norm_mode: str = "linear"
 
-        # UniProt lookup cache and stale-click guard
+        # Score cutoff — cells with scores outside [lo, hi] are hidden
+        self._cut_lo: float = float("-inf")
+        self._cut_hi: float = float("inf")
+
+        # Redraw / selection state
+        self._pending: bool = False
+        self._selected: tuple[int, int] | None = None   # (row block, col block)
+        self._sel_token: int = 0                        # guards against stale UniProt replies
         self._uniprot_cache: dict[str, tuple[str, int]] = {}
-        self._sel_token: int = 0
 
-        # _norm_var is tk.Var, created in _build_controls
-
-        # Tkinter fonts (for geometry only — not used for drawing)
+        # Fonts (tk font for geometry only, PIL fonts for drawing)
         self._lf: tkfont.Font | None = None
         self._cw: int = 8
         self._ch: int = 13
-
-        # PIL fonts
         self._pil_lf: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
         self._pil_cf: ImageFont.FreeTypeFont | ImageFont.ImageFont | None = None
-
-        # Glyph atlas: char -> (cell_px, cell_px, 3) uint8 array
-        self._atlas: dict[str, np.ndarray] = {}
 
         # PhotoImage references (must stay alive to prevent GC)
         self._mx_photo: ImageTk.PhotoImage | None = None
         self._ch_photo: ImageTk.PhotoImage | None = None
         self._rl_photo: ImageTk.PhotoImage | None = None
 
-        self._build_controls()
+        # pygame renderer state (only used when pygame is available)
+        self._pg_screen = None
+        self._pg_size: tuple[int, int] = (0, 0)
+        self._pg_font = None
+        self._pg_cache: dict[tuple, object] = {}   # (bg colour, text) -> cell surface
+
+        self._build_sidebar()
         self._build_matrix_area()
-        self._build_statusbar()
 
         self.update_idletasks()
         self._init_fonts()
         if _pygame is not None:
-            self._init_pygame_embed()
+            self._init_pygame()
 
         if initial_csv:
             self._csv_var.set(initial_csv)
             self._load()
 
-    def _build_controls(self) -> None:
-        bar = tk.Frame(self, bd=1, relief=tk.GROOVE, pady=4)
-        bar.pack(side=tk.TOP, fill=tk.X, padx=4, pady=2)
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
-        row1 = tk.Frame(bar)
-        row1.pack(fill=tk.X, padx=4)
-        tk.Label(row1, text="CSV:").pack(side=tk.LEFT)
+    def _build_sidebar(self) -> None:
+        """All controls live in a fixed-width panel on the left, so the
+        matrix gets the full window height."""
+        outer = tk.Frame(self, width=SIDEBAR_W)
+        outer.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 0), pady=4)
+        outer.pack_propagate(False)
+        footer = tk.Frame(outer)
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
+        side = self._scrollable(outer)
+        wrap = SIDEBAR_W - 50   # wraplength for multi-line labels
+
+        def group(title: str) -> tk.LabelFrame:
+            frame = tk.LabelFrame(side, text=title, padx=6, pady=4)
+            frame.pack(fill=tk.X, pady=(0, 6))
+            frame.columnconfigure(1, weight=1)
+            return frame
+
+        def field(frame, row: int, label, widget, button=None) -> None:
+            """label | widget [| button] on one grid row; label may be a StringVar."""
+            if isinstance(label, tk.Variable):
+                tk.Label(frame, textvariable=label).grid(row=row, column=0, sticky="w")
+            else:
+                tk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            widget.grid(row=row, column=1, columnspan=1 if button else 2, sticky="ew",
+                        padx=(4, 0), pady=1)
+            if button:
+                button.grid(row=row, column=2, padx=(2, 0))
+
+        # --- data: what to load
+        data = group("Data")
         self._csv_var = tk.StringVar()
-        tk.Entry(row1, textvariable=self._csv_var, width=45).pack(side=tk.LEFT, padx=2)
-        tk.Button(row1, text="Browse…", command=self._browse_csv).pack(side=tk.LEFT)
-        tk.Label(row1, text="  FASTA:").pack(side=tk.LEFT)
+        field(data, 0, "CSV", tk.Entry(data, textvariable=self._csv_var, width=10),
+              tk.Button(data, text="…", width=2, command=self._browse_csv))
         self._fasta_var = tk.StringVar()
-        tk.Entry(row1, textvariable=self._fasta_var, width=35).pack(side=tk.LEFT, padx=2)
-        tk.Button(row1, text="Browse…", command=self._browse_fasta).pack(side=tk.LEFT)
-
-        row2 = tk.Frame(bar)
-        row2.pack(fill=tk.X, padx=4, pady=(2, 0))
-        tk.Label(row2, text="Level:").pack(side=tk.LEFT)
+        field(data, 1, "FASTA", tk.Entry(data, textvariable=self._fasta_var, width=10),
+              tk.Button(data, text="…", width=2, command=self._browse_fasta))
         self._level_var = tk.StringVar(value="protein")
-        ttk.Combobox(
-            row2, textvariable=self._level_var, width=8, state="readonly",
-            values=["protein", "residue"],
-        ).pack(side=tk.LEFT, padx=2)
+        field(data, 2, "Level", ttk.Combobox(data, textvariable=self._level_var, width=10,
+                                             state="readonly", values=["protein", "residue"]))
         self._only_linked_var = tk.BooleanVar(value=True)
         self._only_linked_check = tk.Checkbutton(
-            row2, text="Show only linked residues", variable=self._only_linked_var,
+            data, text="Show only linked residues", variable=self._only_linked_var,
+            state=tk.DISABLED,
         )
-        self._only_linked_check.pack(side=tk.LEFT, padx=(4, 0))
-        self._level_var.trace_add("write", lambda *_: self._only_linked_check.configure(
-            state=tk.NORMAL if self._level_var.get() == "residue" else tk.DISABLED
-        ))
-        self._only_linked_check.configure(state=tk.DISABLED)
-        self._n_label_var = tk.StringVar(value="  N (proteins):")
-        self._level_var.trace_add("write", lambda *_: self._n_label_var.set(
-            f"  N ({self._level_var.get()}s):"
-        ))
-        tk.Label(row2, textvariable=self._n_label_var).pack(side=tk.LEFT)
+        self._only_linked_check.grid(row=3, column=0, columnspan=3, sticky="w")
+        self._level_var.trace_add("write", lambda *_: self._on_level_change())
+        self._n_label_var = tk.StringVar(value="N (proteins)")
         self._n_var = tk.IntVar(value=DEFAULT_N)
-        tk.Spinbox(row2, textvariable=self._n_var, from_=10, to=5000, width=6).pack(side=tk.LEFT, padx=2)
-        tk.Label(row2, text="  Order:").pack(side=tk.LEFT)
+        field(data, 4, self._n_label_var,
+              tk.Spinbox(data, textvariable=self._n_var, from_=10, to=5000, width=8))
         self._order_var = tk.StringVar(value="confidence")
-        ttk.Combobox(
-            row2, textvariable=self._order_var, width=12, state="readonly",
-            values=["confidence", "alpha", "cluster", "sequence", "pathway", "complex", "size"],
-        ).pack(side=tk.LEFT, padx=2)
-        tk.Label(row2, text="  Species:").pack(side=tk.LEFT)
+        field(data, 5, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
+                                             state="readonly", values=ORDER_MODES))
         self._species_var = tk.StringVar(value="9606")
-        tk.Entry(row2, textvariable=self._species_var, width=8).pack(side=tk.LEFT, padx=2)
-        self._load_btn = tk.Button(row2, text="Load", command=self._load, width=8)
-        self._load_btn.pack(side=tk.LEFT, padx=8)
-        tk.Button(row2, text="Export PNG…", command=self._export, width=12).pack(side=tk.LEFT, padx=4)
+        field(data, 6, "Species", tk.Entry(data, textvariable=self._species_var, width=10))
+
+        buttons = tk.Frame(data)
+        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        self._load_btn = tk.Button(buttons, text="Load", command=self._load, width=8)
+        self._load_btn.pack(side=tk.LEFT)
+        tk.Button(buttons, text="Export PNG…", command=self._export).pack(side=tk.LEFT, padx=4)
         self._status_var = tk.StringVar(value="No data loaded.")
-        tk.Label(row2, textvariable=self._status_var, fg="gray").pack(side=tk.LEFT, padx=4)
+        tk.Label(data, textvariable=self._status_var, fg="gray", wraplength=wrap,
+                 justify=tk.LEFT).grid(row=8, column=0, columnspan=3, sticky="w")
 
-        row3 = tk.Frame(bar)
-        row3.pack(fill=tk.X, padx=4, pady=(2, 0))
-        tk.Label(row3, text="Colormap:").pack(side=tk.LEFT)
+        # --- display: colours, zoom, aggregation
+        display = group("Display")
         self._cmap_var = tk.StringVar(value="(none)")
-        _cmap_choices = (["(none)", "coolwarm"] if _MPL else ["(none)"])
-        ttk.Combobox(
-            row3, textvariable=self._cmap_var, width=10,
-            state="readonly", values=_cmap_choices,
-        ).pack(side=tk.LEFT, padx=2)
+        field(display, 0, "Colormap", ttk.Combobox(
+            display, textvariable=self._cmap_var, width=10, state="readonly",
+            values=["(none)", "coolwarm"] if _MPL else ["(none)"],
+        ))
         self._cmap_var.trace_add("write", lambda *_: self._on_colormap_change())
-
-        tk.Label(row3, text="   Norm:").pack(side=tk.LEFT)
         self._norm_var = tk.StringVar(value="linear")
-        for _lbl, _val in [("Linear", "linear"), ("Quantile", "quantile")]:
-            tk.Radiobutton(
-                row3, text=_lbl, variable=self._norm_var, value=_val,
-                command=self._on_norm_change,
-            ).pack(side=tk.LEFT)
-
+        norm = tk.Frame(display)
+        for label, value in [("Linear", "linear"), ("Quantile", "quantile")]:
+            tk.Radiobutton(norm, text=label, variable=self._norm_var, value=value,
+                           command=self._on_norm_change).pack(side=tk.LEFT)
+        field(display, 1, "Norm", norm)
         if not _MPL:
-            tk.Label(row3, text="(matplotlib not available)", fg="red").pack(side=tk.LEFT, padx=4)
+            tk.Label(display, text="(matplotlib not available)", fg="red").grid(
+                row=2, column=0, columnspan=3, sticky="w")
+
+        self._zoom_label_var = tk.StringVar(value=f"{CELL_PX_DEFAULT}px")
+        self._zoom = tk.Scale(
+            display, from_=CELL_PX_MIN - BLOCK_ZOOM_STEPS, to=CELL_PX_MAX,
+            orient=tk.HORIZONTAL, showvalue=False, command=self._on_zoom,
+        )
+        self._zoom.set(CELL_PX_DEFAULT)
+        field(display, 3, "Zoom", self._zoom)
+        tk.Label(display, textvariable=self._zoom_label_var, fg="gray").grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=(4, 0))
+        self._agg_method_var = tk.StringVar(value="Mean")
+        field(display, 5, "Aggregate", ttk.Combobox(
+            display, textvariable=self._agg_method_var, width=10, state="readonly",
+            values=list(_AGG_METHODS),
+        ))
+        self._agg_method_var.trace_add("write", lambda *_: self._on_agg_method_change())
+
+        # --- score cutoff: bottom and top limit on one slider
+        cutoff = group("Score cutoff")
+        self._cutoff_slider = RangeSlider(cutoff, command=self._on_cutoff,
+                                          release_command=self._on_cutoff_release)
+        self._cutoff_slider.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self._cutoff_var = tk.StringVar(value="–")
+        tk.Label(cutoff, textvariable=self._cutoff_var, justify=tk.LEFT).grid(
+            row=1, column=0, columnspan=2, sticky="w")
+        tk.Button(cutoff, text="Reset", command=self._reset_cutoff).grid(row=1, column=2, sticky="e")
+
+        # --- selection info
+        selection = group("Selection")
+        self._sel_info_var = tk.StringVar(value="")
+        tk.Label(selection, textvariable=self._sel_info_var, anchor="w", justify=tk.LEFT,
+                 wraplength=wrap, fg="#1a6fb5", font=("TkFixedFont", 9)).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+
+        # --- footer
+        renderer = "pygame SDL2 (GPU)" if _pygame is not None else "numpy (CPU)"
+        tk.Label(footer, text=f"renderer: {renderer}", fg="#aaaaaa").pack(side=tk.BOTTOM, anchor="w")
+        self._info_var = tk.StringVar(value="")
+        tk.Label(footer, textvariable=self._info_var, fg="gray").pack(side=tk.BOTTOM, anchor="w")
+
+    def _scrollable(self, parent: tk.Frame) -> tk.Frame:
+        """Return a frame inside a vertically scrollable canvas, so the
+        sidebar stays usable when the window is shorter than its content."""
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        bar = tk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas)
+        window = canvas.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def wheel(event: tk.Event) -> None:
+            # global binding, but only scroll while the pointer is over the sidebar
+            over = self.winfo_containing(event.x_root, event.y_root)
+            if over is not None and str(over).startswith(str(parent)):
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        self.bind_all("<MouseWheel>", wheel, add="+")
+        return inner
 
     def _build_matrix_area(self) -> None:
         outer = tk.Frame(self)
-        outer.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=4, pady=2)
+        outer.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
         outer.rowconfigure(1, weight=1)
         outer.columnconfigure(1, weight=1)
 
+        # corner | column headers
+        # row labels | matrix
         self._corner = tk.Frame(outer, bg=BG)
         self._corner.grid(row=0, column=0, sticky="nsew")
-
         self._ch_canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
         self._ch_canvas.grid(row=0, column=1, sticky="nsew")
-
         self._rl_canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
         self._rl_canvas.grid(row=1, column=0, sticky="nsew")
-
         self._mx = tk.Canvas(outer, bg=BG, highlightthickness=0)
         self._mx.grid(row=1, column=1, sticky="nsew")
 
@@ -330,44 +482,11 @@ class MatrixApp(tk.Tk):
         self._mx.bind("<Button-4>", self._wheel)
         self._mx.bind("<Button-5>", self._wheel)
         self._mx.bind("<Button-1>", self._on_click)
-        self._mx.bind("<Up>",    lambda e: self._arrow(0, -1))
-        self._mx.bind("<Down>",  lambda e: self._arrow(0,  1))
-        self._mx.bind("<Left>",  lambda e: self._arrow(-1, 0))
-        self._mx.bind("<Right>", lambda e: self._arrow( 1, 0))
+        self._mx.bind("<Up>",    lambda e: self._scroll(0, -1))
+        self._mx.bind("<Down>",  lambda e: self._scroll(0,  1))
+        self._mx.bind("<Left>",  lambda e: self._scroll(-1, 0))
+        self._mx.bind("<Right>", lambda e: self._scroll( 1, 0))
         self._mx.focus_set()
-
-    def _build_statusbar(self) -> None:
-        bar = tk.Frame(self, bd=1, relief=tk.GROOVE, pady=3)
-        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=2)
-
-        row1 = tk.Frame(bar)
-        row1.pack(fill=tk.X)
-        tk.Label(row1, text="Zoom:").pack(side=tk.LEFT, padx=(4, 0))
-        self._zoom = tk.Scale(
-            row1, from_=CELL_PX_MIN - BLOCK_ZOOM_STEPS, to=CELL_PX_MAX,
-            orient=tk.HORIZONTAL, length=200, showvalue=False,
-            command=self._on_zoom,
-        )
-        self._zoom.set(CELL_PX_DEFAULT)
-        self._zoom.pack(side=tk.LEFT, padx=4)
-        self._zoom_label_var = tk.StringVar(value=f"{CELL_PX_DEFAULT}px")
-        tk.Label(row1, textvariable=self._zoom_label_var, width=14, anchor="w").pack(side=tk.LEFT)
-
-        tk.Label(row1, text="  Aggregate:").pack(side=tk.LEFT, padx=(8, 0))
-        self._agg_method_var = tk.StringVar(value=_AGG_METHOD_LABELS[0])
-        ttk.Combobox(
-            row1, textvariable=self._agg_method_var, width=13, state="readonly",
-            values=_AGG_METHOD_LABELS,
-        ).pack(side=tk.LEFT, padx=2)
-        self._agg_method_var.trace_add("write", lambda *_: self._on_agg_method_change())
-
-        self._info_var = tk.StringVar(value="")
-        tk.Label(row1, textvariable=self._info_var, fg="gray").pack(side=tk.LEFT, padx=8)
-        tk.Label(row1, text=f"renderer: {_RENDERER_LABEL}", fg="#aaaaaa").pack(side=tk.RIGHT, padx=8)
-
-        self._sel_info_var = tk.StringVar(value="")
-        tk.Label(bar, textvariable=self._sel_info_var, anchor="w",
-                 fg="#1a6fb5", font=("TkFixedFont", 9)).pack(fill=tk.X, padx=8, pady=(0, 2))
 
     def _init_fonts(self) -> None:
         self._lf = tkfont.Font(family="TkFixedFont", size=LABEL_FONT_SIZE)
@@ -375,56 +494,42 @@ class MatrixApp(tk.Tk):
         self._ch = self._lf.metrics("linespace")
         self._pil_lf = _find_pil_font(LABEL_FONT_SIZE + 2)
         self._pil_cf = _find_pil_font(max(6, CELL_PX_DEFAULT - 2))
-        self._atlas = _build_glyph_atlas(self._pil_cf, CELL_PX_DEFAULT)
         self._sync_sizes()
 
     def _update_cell_font(self) -> None:
         self._pil_cf = _find_pil_font(max(6, self._cell_px - 2))
-        self._atlas = _build_glyph_atlas(self._pil_cf, self._cell_px)
-        if _pygame is not None and hasattr(self, "_pg_screen"):
+        if self._pg_screen is not None:
             self._pg_font = _pygame.font.Font(None, max(8, self._cell_px - 2))
-            self._pg_score_cache = {}
-            self._build_pg_atlas()
+            self._pg_cache.clear()
 
-    def _init_pygame_embed(self) -> None:
+    def _init_pygame(self) -> None:
+        """Embed an SDL window into the matrix canvas and start its redraw loop."""
         self.update_idletasks()
         os.environ["SDL_WINDOWID"] = str(self._mx.winfo_id())
         _pygame.display.quit()
         _pygame.display.init()
         _pygame.font.init()
-        w = max(1, self._mx.winfo_width())
-        h = max(1, self._mx.winfo_height())
-        self._pg_screen: _pygame.Surface = _pygame.display.set_mode((w, h), 0, 32)  # type: ignore[name-defined]
-        self._pg_size: tuple[int, int] = (w, h)
-        self._pg_atlas: dict[str, _pygame.Surface] = {}  # type: ignore[name-defined]
-        self._pg_font: _pygame.font.Font = _pygame.font.Font(None, max(8, self._cell_px - 2))  # type: ignore[name-defined]
-        self._pg_score_cache: dict[str, _pygame.Surface] = {}  # type: ignore[name-defined]
-        self._build_pg_atlas()
+        size = (max(1, self._mx.winfo_width()), max(1, self._mx.winfo_height()))
+        self._pg_screen = _pygame.display.set_mode(size, 0, 32)
+        self._pg_size = size
+        self._pg_font = _pygame.font.Font(None, max(8, self._cell_px - 2))
         self._pg_loop()
 
     def _pg_loop(self) -> None:
-        """Continuous 60 fps loop that keeps the pygame surface alive over tkinter repaints."""
+        """Continuous ~60 fps loop that keeps the pygame surface alive over tkinter repaints."""
         try:
-            if _pygame is not None and hasattr(self, "_pg_screen"):
-                if self._proteins:
-                    self._draw_matrix()
-                else:
-                    self._pg_screen.fill(_BG_PG)
-                    _pygame.display.flip()
+            if self._proteins:
+                self._draw_matrix()
+            else:
+                self._pg_screen.fill(_BG)
+                _pygame.display.flip()
         except Exception:
             pass
         self.after(16, self._pg_loop)
 
-    def _build_pg_atlas(self) -> None:
-        cp = self._cell_px
-        font = self._pil_cf
-        self._pg_atlas = {}
-        for ch in _GLYPH_CHARS:
-            g = Image.new("RGB", (cp, cp), _BG)
-            ImageDraw.Draw(g).text((cp // 2, cp // 2), ch, font=font, anchor="mm", fill=_FG)
-            arr = np.array(g, dtype=np.uint8)
-            surf = _pygame.surfarray.make_surface(np.swapaxes(arr, 0, 1))
-            self._pg_atlas[ch] = surf.convert()
+    # ------------------------------------------------------------------
+    # Geometry & scrolling
+    # ------------------------------------------------------------------
 
     @property
     def _label_w(self) -> int:
@@ -436,324 +541,59 @@ class MatrixApp(tk.Tk):
         return lines * self._ch + 2
 
     def _sync_sizes(self) -> None:
-        lw, hh = self._label_w, self._header_h
-        self._corner.configure(width=lw, height=hh)
-        self._rl_canvas.configure(width=lw)
-        self._ch_canvas.configure(height=hh)
-
-    def _virtual(self) -> tuple[int, int]:
-        s = len(self._blocks) * self._cell_px
-        return s, s
+        self._corner.configure(width=self._label_w, height=self._header_h)
+        self._rl_canvas.configure(width=self._label_w)
+        self._ch_canvas.configure(height=self._header_h)
 
     def _update_scrollregion(self) -> None:
-        vw, vh = self._virtual()
-        self._mx.configure(scrollregion=(0, 0, vw, vh))
-        self._ch_canvas.configure(scrollregion=(0, 0, vw, self._header_h))
-        self._rl_canvas.configure(scrollregion=(0, 0, self._label_w, vh))
+        size = len(self._blocks) * self._cell_px
+        self._mx.configure(scrollregion=(0, 0, size, size))
+        self._ch_canvas.configure(scrollregion=(0, 0, size, self._header_h))
+        self._rl_canvas.configure(scrollregion=(0, 0, self._label_w, size))
 
     def _yscroll(self, *args) -> None:
         self._mx.yview(*args)
         self._rl_canvas.yview(*args)
-        self._schedule(fast=True)
+        self._schedule()
 
     def _xscroll(self, *args) -> None:
         self._mx.xview(*args)
         self._ch_canvas.xview(*args)
-        self._schedule(fast=True)
+        self._schedule()
 
     def _wheel(self, event: tk.Event) -> None:
-        delta = 3 if (event.num == 5 or event.delta < 0) else -3
-        self._mx.yview_scroll(delta, "units")
-        self._rl_canvas.yview_scroll(delta, "units")
-        self._schedule(fast=True)
+        self._scroll(0, 3 if (event.num == 5 or event.delta < 0) else -3)
 
-    def _arrow(self, dx: int, dy: int) -> None:
+    def _scroll(self, dx: int, dy: int) -> None:
         if dy:
             self._mx.yview_scroll(dy, "units")
             self._rl_canvas.yview_scroll(dy, "units")
         if dx:
             self._mx.xview_scroll(dx, "units")
             self._ch_canvas.xview_scroll(dx, "units")
-        self._schedule(fast=True)
-
-    def _on_zoom(self, value: str) -> None:
-        v = int(float(value))
-        if v >= CELL_PX_MIN:
-            self._cell_px = v
-            new_block_size = 1
-            self._zoom_label_var.set(f"{v}px")
-        else:
-            self._cell_px = CELL_PX_MIN
-            steps = CELL_PX_MIN - v
-            new_block_size = min(BLOCK_SIZE_MAX, max(2, round(BLOCK_ZOOM_GROWTH ** steps)))
-            self._zoom_label_var.set(f"≤{new_block_size} → {CELL_PX_MIN}px")
-        self._update_cell_font()
-        if new_block_size != self._block_size:
-            self._block_size = new_block_size
-            self._recompute_blocks()
-            if hasattr(self, "_pg_score_cache"):
-                self._pg_score_cache = {}
-        self._update_scrollregion()
         self._schedule()
 
-    def _on_agg_method_change(self) -> None:
-        self._agg_method = _AGG_METHOD_MAP.get(self._agg_method_var.get(), "mean")
-        self._reduce_block_scores()
-        if hasattr(self, "_pg_score_cache"):
-            self._pg_score_cache = {}
-        self._schedule()
+    def _visible_blocks(self) -> tuple[range, range]:
+        """(visible row blocks, visible column blocks) of the matrix canvas."""
+        n, cp, c = len(self._blocks), self._cell_px, self._mx
+        rows = range(max(0, int(c.canvasy(0) // cp)), min(n, int(c.canvasy(c.winfo_height()) // cp) + 1))
+        cols = range(max(0, int(c.canvasx(0) // cp)), min(n, int(c.canvasx(c.winfo_width()) // cp) + 1))
+        return rows, cols
 
-    def _recompute_blocks(self) -> None:
-        n = len(self._proteins)
-        proteins, section, split, bs = self._proteins, self._section, self._split, self._block_size
-        if n == 0:
-            self._blocks, self._item_to_block, self._split_block = [], [], 0
-        else:
-            if bs <= 1:
-                blocks = [(i, i + 1) for i in range(n)]
-            else:
-                has_sep = 0 < split < n
-                blocks = []
-                i = 0
-                while i < n:
-                    sec0 = section.get(proteins[i], "") if section is not None else None
-                    limit = min(n, i + bs)
-                    j = i + 1
-                    while j < limit:
-                        if has_sep and j == split:
-                            break
-                        if section is not None and section.get(proteins[j], "") != sec0:
-                            break
-                        j += 1
-                    blocks.append((i, j))
-                    i = j
-            item_to_block = [0] * n
-            for bi, (s, e) in enumerate(blocks):
-                item_to_block[s:e] = [bi] * (e - s)
-            self._blocks = blocks
-            self._item_to_block = item_to_block
-            self._split_block = item_to_block[split] if 0 <= split < n else len(blocks)
-        self._recompute_block_buckets()
-        self._reduce_block_scores()
-
-    def _recompute_block_buckets(self) -> None:
-        buckets: dict[tuple[int, int], list[float]] = {}
-        if self._block_size > 1 and self._blocks:
-            item_to_block, idx = self._item_to_block, self._item_index
-            for (pi, pj), score in self._sparse.items():
-                bi, bj = idx.get(pi), idx.get(pj)
-                if bi is None or bj is None:
-                    continue  # defensive; sparse keys are always in self._proteins
-                bi, bj = item_to_block[bi], item_to_block[bj]
-                key = (bi, bj) if bi <= bj else (bj, bi)
-                buckets.setdefault(key, []).append(score)
-        self._block_pair_raw = buckets
-
-    def _reduce_block_scores(self) -> None:
-        method = self._agg_method
-        scores: dict[tuple[int, int], float] = {}
-        counts: dict[tuple[int, int], int] = {}
-        for key, vals in self._block_pair_raw.items():
-            counts[key] = len(vals)
-            if method == "max":
-                scores[key] = max(vals)
-            elif method == "geomean":
-                pos = [v for v in vals if v > 0]
-                if pos:
-                    scores[key] = math.exp(sum(math.log(v) for v in pos) / len(pos))
-                else:
-                    # No positive scores contribute to this block-pair. Geometric
-                    # mean is undefined for non-positive inputs; fall back to the
-                    # arithmetic mean rather than dropping the pair (which would
-                    # wrongly render as "no crosslink" and hide real data).
-                    scores[key] = sum(vals) / len(vals)
-            else:  # "mean"
-                scores[key] = sum(vals) / len(vals)
-        self._block_scores = scores
-        self._block_pair_n = counts
-
-    def _on_click(self, event: tk.Event) -> None:
-        """Handle left-click on the matrix canvas (numpy path fallback)."""
-        if not self._proteins or not self._blocks:
-            return
-        ox = int(self._mx.canvasx(0))
-        oy = int(self._mx.canvasy(0))
-        cp = self._cell_px
-        cb = (event.x + ox) // cp
-        rb = (event.y + oy) // cp
-        n = len(self._blocks)
-        if 0 <= rb < n and 0 <= cb < n:
-            self._on_block_select(rb, cb)
-        else:
-            self._selected = None
-            self._sel_info_var.set("")
-        self._schedule()
-
-    def _item_protein(self, item) -> str:
-        """The parent protein name for a protein-mode or residue-mode axis item."""
-        return item.protein if self._level == "residue" else item
-
-    def _on_cell_select(self, row: int, col: int) -> None:
-        self._selected = (row, col)
-        self._sel_token += 1
-        token = self._sel_token
-        pi = self._proteins[row]
-        pj = self._proteins[col]
-        key = (min(pi, pj), max(pi, pj))
-        score = self._sparse.get(key)
-        score_line = f"score: {score:.4f}" if score is not None else "(no crosslink)"
-
-        def _fmt_local(item) -> str:
-            protein = self._item_protein(item)
-            tag = "decoy" if self._decoy.get(item) else "target"
-            aa = f"{len(self._seqs[protein])} aa" if protein in self._seqs else "fetching…"
-            sec = (self._section.get(item, "") if self._section else "")
-            sec_part = f"  [{sec}]" if sec else ""
-            return f"{item}  ({aa}, {tag}){sec_part}"
-
-        self._sel_info_var.set(f"{_fmt_local(pi)}\n{_fmt_local(pj)}\n{score_line}")
-        threading.Thread(
-            target=self._fetch_uniprot_info, args=(pi, pj, token), daemon=True
-        ).start()
-
-    def _fetch_uniprot_accession(self, accession: str) -> tuple[str, int] | None:
-        import urllib.request
-        import json as _json
-
-        if accession in self._uniprot_cache:
-            return self._uniprot_cache[accession]
-        url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read().decode())
-            name = (data.get("proteinDescription", {})
-                        .get("recommendedName", {})
-                        .get("fullName", {})
-                        .get("value", accession))
-            length = int(data.get("sequence", {}).get("length", 0))
-            result: tuple[str, int] = (name, length)
-            self._uniprot_cache[accession] = result
-            return result
-        except Exception:
-            return None
-
-    def _fetch_uniprot_info(self, pi, pj, token: int) -> None:
-        acc_i = _short_accession(self._item_protein(pi))
-        acc_j = _short_accession(self._item_protein(pj))
-        ri = self._fetch_uniprot_accession(acc_i)
-        rj = self._fetch_uniprot_accession(acc_j)
-
-        def _update() -> None:
-            if self._sel_token != token:
-                return
-            key = (min(pi, pj), max(pi, pj))
-            score = self._sparse.get(key)
-            score_line = f"score: {score:.4f}" if score is not None else "(no crosslink)"
-
-            def _line(item, acc: str, r: tuple[str, int] | None) -> str:
-                tag = "decoy" if self._decoy.get(item) else "target"
-                sec = (self._section.get(item, "") if self._section else "")
-                sec_part = f"  [{sec}]" if sec else ""
-                pos_part = f"  pos {item.pos}" if self._level == "residue" else ""
-                if r:
-                    return f"{r[0]}  ({r[1]} aa, {tag}){sec_part}{pos_part}  [{acc}]"
-                return f"{item}  (?, {tag}){sec_part}"
-
-            self._sel_info_var.set(
-                f"{_line(pi, acc_i, ri)}\n{_line(pj, acc_j, rj)}\n{score_line}"
-            )
-
-        self.after(0, _update)
-
-    def _agg_method_label(self) -> str:
-        return {"mean": "Mean", "geomean": "Geometric mean", "max": "Max"}.get(self._agg_method, "Mean")
-
-    def _block_score_line(self, rb: int, cb: int) -> str:
-        key = (rb, cb) if rb <= cb else (cb, rb)
-        score = self._block_scores.get(key)
-        if score is None:
-            return "(no crosslinks between these blocks)"
-        n_pairs = self._block_pair_n.get(key, 0)
-        return f"{self._agg_method_label()} of {n_pairs} crosslink(s): {score:.4f}"
-
-    def _on_block_select(self, rb: int, cb: int) -> None:
-        self._selected = (rb, cb)
-        r_lo, r_hi = self._blocks[rb]
-        c_lo, c_hi = self._blocks[cb]
-        if r_hi - r_lo == 1 and c_hi - c_lo == 1:
-            self._on_cell_select(r_lo, c_lo)
-            return
-
-        self._sel_token += 1
-        token = self._sel_token
-        row_items = self._proteins[r_lo:r_hi]
-        col_items = self._proteins[c_lo:c_hi]
-        score_line = self._block_score_line(rb, cb)
-
-        def _fmt_block(items) -> str:
-            decoys = {self._decoy.get(it, False) for it in items}
-            tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
-            secs = {self._section.get(it, "") for it in items} if self._section else set()
-            sec = next(iter(secs)) if len(secs) == 1 else None
-            sec_part = f"  [{sec}]" if sec else ""
-            return f"{len(items)} items ({tag}){sec_part}"
-
-        self._sel_info_var.set(f"{_fmt_block(row_items)}\n{_fmt_block(col_items)}\n{score_line}")
-
-        row_proteins = {self._item_protein(it) for it in row_items}
-        col_proteins = {self._item_protein(it) for it in col_items}
-        if len(row_proteins) == 1 and len(col_proteins) == 1:
-            threading.Thread(
-                target=self._fetch_uniprot_info_block,
-                args=(row_items, col_items, token),
-                daemon=True,
-            ).start()
-
-    def _fetch_uniprot_info_block(self, row_items: list, col_items: list, token: int) -> None:
-        acc_i = _short_accession(self._item_protein(row_items[0]))
-        acc_j = _short_accession(self._item_protein(col_items[0]))
-        ri = self._fetch_uniprot_accession(acc_i)
-        rj = self._fetch_uniprot_accession(acc_j)
-
-        def _pos_range(items: list) -> str:
-            if self._level != "residue":
-                return ""
-            positions = sorted(it.pos for it in items)
-            if len(positions) == 1:
-                return f"  pos {positions[0]}"
-            return f"  pos {positions[0]}-{positions[-1]}"
-
-        def _update() -> None:
-            if self._sel_token != token or self._selected is None:
-                return
-            rb, cb = self._selected
-            score_line = self._block_score_line(rb, cb)
-
-            def _line(items: list, acc: str, r: tuple[str, int] | None) -> str:
-                decoys = {self._decoy.get(it, False) for it in items}
-                tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
-                sec = self._section.get(items[0], "") if self._section else ""
-                sec_part = f"  [{sec}]" if sec else ""
-                pos_part = _pos_range(items)
-                if r:
-                    return f"{r[0]}  ({r[1]} aa, {tag}){sec_part}{pos_part}  [{acc}]"
-                return f"{len(items)} items  (?, {tag}){sec_part}"
-
-            self._sel_info_var.set(
-                f"{_line(row_items, acc_i, ri)}\n{_line(col_items, acc_j, rj)}\n{score_line}"
-            )
-
-        self.after(0, _update)
-
-    def _clear_selection(self) -> None:
-        self._selected = None
-        self._sel_info_var.set("")
-
-    def _schedule(self, fast: bool = False) -> None:
+    def _schedule(self) -> None:
+        """Coalesce redraw requests into one redraw on the next idle tick."""
         if not self._pending:
             self._pending = True
             self.after(0, self._redraw)
+
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
+
+    def _on_level_change(self) -> None:
+        level = self._level_var.get()
+        self._only_linked_check.configure(state=tk.NORMAL if level == "residue" else tk.DISABLED)
+        self._n_label_var.set(f"N ({level}s)")
 
     def _browse_csv(self) -> None:
         p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
@@ -761,21 +601,19 @@ class MatrixApp(tk.Tk):
             self._csv_var.set(p)
 
     def _browse_fasta(self) -> None:
-        p = filedialog.askopenfilename(
-            filetypes=[("FASTA", "*.fasta *.fa *.faa"), ("All", "*.*")]
-        )
+        p = filedialog.askopenfilename(filetypes=[("FASTA", "*.fasta *.fa *.faa"), ("All", "*.*")])
         if p:
             self._fasta_var.set(p)
 
     def _load(self) -> None:
         csv = self._csv_var.get().strip()
-        if not csv:
-            messagebox.showerror("Error", "Please select a CSV file.")
-            return
         level = self._level_var.get()
         order = self._order_var.get()
         fasta = self._fasta_var.get().strip() or None
         only_linked = self._only_linked_var.get()
+        if not csv:
+            messagebox.showerror("Error", "Please select a CSV file.")
+            return
         if order == "sequence" and not fasta:
             messagebox.showerror("Error", "Order 'sequence' requires a FASTA file.")
             return
@@ -798,17 +636,64 @@ class MatrixApp(tk.Tk):
                 if level == "residue":
                     items, sparse, decoy = build_residue_matrix(csv, n=n)
                     if not only_linked:
-                        items, decoy = _add_unlinked_residues(items, decoy, seqs or {})
-                    items, section = _sort_residues(items, sparse, decoy, order, seqs, species)
+                        items, decoy = add_unlinked_residues(items, decoy, seqs or {})
+                    items, section = sort_residues(items, decoy, order, seqs, species)
                 else:
                     items, sparse, decoy = build_matrix(csv, n=n)
-                    items, section = _sort_proteins(items, sparse, decoy, order, seqs, species)
+                    items, section = sort_proteins(items, decoy, order, seqs, species)
                 self.after(0, lambda: self._on_loaded(items, sparse, decoy, section, seqs, level))
             except Exception as exc:
                 msg = str(exc)
                 self.after(0, lambda: self._on_error(msg))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_loaded(self, items: list, sparse: dict, decoy: dict, section: dict | None,
+                   seqs: dict[str, str] | None, level: str) -> None:
+        self._level = level
+        self._proteins = items
+        self._sparse = sparse
+        self._decoy = decoy
+        self._section = section
+        self._seqs = seqs or {}
+        if level == "residue":
+            self._col_labels = [str(r.pos)[:COL_W] for r in items]
+            self._row_labels = [f"{short_accession(r.protein)}:{r.pos}"[:ROW_W] for r in items]
+        else:
+            self._col_labels = [p[:COL_W] for p in items]
+            self._row_labels = [p[:ROW_W] for p in items]
+        self._split = next((i for i, p in enumerate(items) if decoy.get(p, False)), len(items))
+        scores = list(sparse.values())
+        self._min_score = min(scores) if scores else 0.0
+        self._max_score = max(scores) if scores else 1.0
+        self._score_sorted = np.sort(scores) if scores else np.array([])
+        self._item_index = {p: i for i, p in enumerate(items)}
+        self._cut_lo, self._cut_hi = self._min_score, self._max_score
+        self._cutoff_slider.set_bounds(self._cut_lo, self._cut_hi)
+        self._update_cutoff_label()
+        self._recompute_blocks()
+
+        unit = "residues" if level == "residue" else "proteins"
+        self._status_var.set(
+            f"Loaded — {self._split} targets · {len(items) - self._split} decoys · {len(sparse)} links"
+        )
+        self._info_var.set(f"{len(items)} {unit}")
+        self._load_btn.configure(state=tk.NORMAL)
+        self._sync_sizes()
+        self._update_scrollregion()
+        for view in (self._mx.xview_moveto, self._mx.yview_moveto,
+                     self._ch_canvas.xview_moveto, self._rl_canvas.yview_moveto):
+            view(0)
+        self._schedule()
+
+    def _on_error(self, msg: str) -> None:
+        self._load_btn.configure(state=tk.NORMAL)
+        self._status_var.set(f"Error: {msg}")
+        messagebox.showerror("Load error", msg)
+
+    # ------------------------------------------------------------------
+    # Colours
+    # ------------------------------------------------------------------
 
     def _on_colormap_change(self) -> None:
         name = self._cmap_var.get()
@@ -817,205 +702,272 @@ class MatrixApp(tk.Tk):
         else:
             self._cmap_name = name
             self._cmap_lut = _make_lut(name)
-        if hasattr(self, "_pg_score_cache"):
-            self._pg_score_cache = {}
+        self._pg_cache.clear()
         self._schedule()
 
     def _on_norm_change(self) -> None:
         self._norm_mode = self._norm_var.get()
-        if hasattr(self, "_pg_score_cache"):
-            self._pg_score_cache = {}
+        self._pg_cache.clear()
         self._schedule()
 
-    def _on_loaded(
-        self,
-        proteins: list,
-        sparse: dict[tuple, float],
-        decoy: dict,
-        section: dict | None,
-        seqs: dict[str, str] | None = None,
-        level: str = "protein",
-    ) -> None:
-        self._level = level
-        self._proteins = proteins
-        self._sparse = sparse
-        self._decoy = decoy
-        self._section = section
-        self._seqs: dict[str, str] = seqs or {}
-        if level == "residue":
-            self._col_labels = [str(r.pos)[:COL_W] for r in proteins]
-            self._row_labels = [f"{_short_accession(r.protein)}:{r.pos}"[:ROW_W] for r in proteins]
-        else:
-            self._col_labels = [p[:COL_W] for p in proteins]
-            self._row_labels = [p[:ROW_W] for p in proteins]
-        self._thresholds = _build_thresholds(sparse) if sparse else []
-        self._split = next(
-            (i for i, p in enumerate(proteins) if decoy.get(p, False)), len(proteins)
-        )
-        self._min_score = min(sparse.values()) if sparse else 0.0
-        self._max_score = max(sparse.values()) if sparse else 1.0
-        self._score_sorted = np.sort(list(sparse.values())) if sparse else np.array([])
+    def _cell_colour(self, score: float) -> tuple[int, int, int]:
+        """Background colour of a cell: colormap if one is selected, else
+        greyscale from light (low score) to dark (high score)."""
         if self._cmap_lut is not None:
-            self._cmap_lut = _make_lut(self._cmap_name)
-        self._item_index = {p: i for i, p in enumerate(proteins)}
-        self._recompute_blocks()
-        n_t = self._split
-        n_d = len(proteins) - n_t
-        unit = "residues" if level == "residue" else "proteins"
-        self._status_var.set(f"Loaded — {n_t} targets · {n_d} decoys · {len(sparse)} links")
-        self._info_var.set(f"{len(proteins)} {unit}")
-        self._load_btn.configure(state=tk.NORMAL)
-        self._sync_sizes()
-        self._update_scrollregion()
-        self._mx.xview_moveto(0)
-        self._mx.yview_moveto(0)
-        self._ch_canvas.xview_moveto(0)
-        self._rl_canvas.yview_moveto(0)
+            quantile = self._score_sorted if self._norm_mode == "quantile" else None
+            return _score_to_bg(score, self._min_score, self._max_score, self._cmap_lut, quantile)
+        mn, mx = self._min_score, self._max_score
+        grey = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
+        grey = max(40, min(200, grey))
+        return grey, grey, grey
+
+    @staticmethod
+    def _cell_text(score: float, cell_px: int) -> str | None:
+        """The score printed inside a cell, once cells are big enough."""
+        return f"{score:.2f}" if cell_px >= SCORE_THRESHOLD_PX else None
+
+    # ------------------------------------------------------------------
+    # Score cutoff
+    # ------------------------------------------------------------------
+
+    def _in_cutoff(self, score: float) -> bool:
+        return self._cut_lo <= score <= self._cut_hi
+
+    def _on_cutoff(self, lo: float, hi: float) -> None:
+        """Slider moved: hide cells outside [lo, hi]. Colours keep the
+        full-range scale, so only visibility changes."""
+        self._cut_lo, self._cut_hi = lo, hi
+        if self._block_size > 1:
+            self._recompute_block_buckets()
+            self._reduce_block_scores()
+        self._update_cutoff_label()
         self._schedule()
 
-    def _on_error(self, msg: str) -> None:
-        self._load_btn.configure(state=tk.NORMAL)
-        self._status_var.set(f"Error: {msg}")
-        messagebox.showerror("Load error", msg)
+    def _on_cutoff_release(self, lo: float, hi: float) -> None:
+        if self._selected is not None:
+            self._select_block(*self._selected)   # refresh the info text
 
-    def _export(self) -> None:
-        if not self._proteins:
-            messagebox.showerror("Export", "No data loaded.")
+    def _reset_cutoff(self) -> None:
+        if not self._sparse:
             return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png")],
-            title="Export Matrix as PNG",
-        )
-        if not path:
-            return
-        self._status_var.set("Exporting…")
-        threading.Thread(target=self._export_worker, args=(path,), daemon=True).start()
+        self._cutoff_slider.set_bounds(self._min_score, self._max_score)
+        self._on_cutoff(self._min_score, self._max_score)
+        self._on_cutoff_release(self._min_score, self._max_score)
 
-    def _export_worker(self, path: str) -> None:
-        try:
-            img = self._render_full_image()
-            img.save(path)
-            name = os.path.basename(path)
-            self.after(0, lambda: self._status_var.set(f"Exported → {name}"))
-        except Exception as exc:
-            msg = str(exc)
-            self.after(0, lambda: self._status_var.set(f"Export failed: {msg}"))
+    def _update_cutoff_label(self) -> None:
+        scores = self._score_sorted
+        shown = int(np.searchsorted(scores, self._cut_hi, side="right")
+                    - np.searchsorted(scores, self._cut_lo, side="left"))
+        self._cutoff_var.set(f"{self._cut_lo:.4g} – {self._cut_hi:.4g}\n"
+                             f"{shown} of {len(scores)} links shown")
 
-    def _render_full_image(self) -> Image.Image:
-        cp = min(self._cell_px, 16)
-        n = len(self._proteins)
-        proteins = self._proteins
-        sparse = self._sparse
-        thresholds = self._thresholds
-        split = self._split
+    # ------------------------------------------------------------------
+    # Zoom & block aggregation
+    # ------------------------------------------------------------------
+
+    def _on_zoom(self, value: str) -> None:
+        v = int(float(value))
+        if v >= CELL_PX_MIN:
+            self._cell_px = v
+            block_size = 1
+            self._zoom_label_var.set(f"{v}px")
+        else:
+            # below the minimum cell size, zooming out merges items into blocks
+            self._cell_px = CELL_PX_MIN
+            steps = CELL_PX_MIN - v
+            block_size = min(BLOCK_SIZE_MAX, max(2, round(BLOCK_ZOOM_GROWTH ** steps)))
+            self._zoom_label_var.set(f"≤{block_size} → {CELL_PX_MIN}px")
+        self._update_cell_font()
+        if block_size != self._block_size:
+            self._block_size = block_size
+            self._recompute_blocks()
+            self._pg_cache.clear()
+        self._update_scrollregion()
+        self._schedule()
+
+    def _on_agg_method_change(self) -> None:
+        self._agg_method = _AGG_METHODS.get(self._agg_method_var.get(), "mean")
+        self._reduce_block_scores()
+        self._pg_cache.clear()
+        self._schedule()
+
+    def _recompute_blocks(self) -> None:
+        """Group consecutive items into blocks of at most block_size items.
+        A block never crosses the target/decoy split or a section boundary."""
+        items, section, split, bs = self._proteins, self._section, self._split, self._block_size
+        n = len(items)
         has_sep = 0 < split < n
 
-        font_lbl = _find_pil_font(LABEL_FONT_SIZE + 2)
-        font_cell = _find_pil_font(max(6, cp - 2))
-        lh = self._ch
-        lw = self._label_w
+        def same_block(i: int, j: int) -> bool:
+            if has_sep and j == split:
+                return False
+            return section is None or section.get(items[j], "") == section.get(items[i], "")
 
-        hdr_lines = (1 if self._section else 0) + COL_W + 1
-        hh = hdr_lines * lh + 2
-        total_w = lw + n * cp
-        total_h = hh + n * cp
-
-        img = Image.new("RGB", (total_w, total_h), _BG)
-        draw = ImageDraw.Draw(img)
-
-        # column headers
-        y = 0
-        if self._section is not None:
-            i = 0
-            while i < n:
-                sec = self._section.get(proteins[i], "")
-                j = i + 1
-                while j < n and not (has_sep and j == split) \
-                        and self._section.get(proteins[j], "") == sec:
+        blocks = []
+        i = 0
+        while i < n:
+            j = i + 1
+            if bs > 1:
+                while j < min(n, i + bs) and same_block(i, j):
                     j += 1
-                x0s = lw + i * cp;  x1s = lw + j * cp
-                if sec:
-                    draw.text(((x0s + x1s) // 2, y + lh // 2), sec,
-                              font=font_lbl, anchor="mm", fill=_FG)
-                    draw.rectangle([x0s, y, x1s - 1, y + lh - 1], outline=_SEP)
-                i = j
-            y += lh
+            blocks.append((i, j))
+            i = j
 
-        labels_col = self._col_labels
-        max_char = max((len(lb) for lb in labels_col), default=0)
-        for char_idx in range(max_char):
-            for ci in range(n):
-                lb = labels_col[ci]
-                ch = lb[char_idx] if char_idx < len(lb) else " "
-                if ch != " ":
-                    draw.text((lw + ci * cp + cp // 2, y + lh // 2), ch,
-                              font=font_lbl, anchor="mm", fill=_FG)
-            y += lh
+        self._blocks = blocks
+        self._item_to_block = [bi for bi, (s, e) in enumerate(blocks) for _ in range(s, e)]
+        self._split_block = self._item_to_block[split] if 0 <= split < n else len(blocks)
+        self._recompute_block_buckets()
+        self._reduce_block_scores()
 
-        draw.line([(lw, y), (total_w, y)], fill=_SEP, width=1)
-        if has_sep:
-            draw.text((lw + split * cp, y), "+", font=font_lbl, anchor="mm", fill=_SEP)
-
-        # row labels
-        for ri in range(n):
-            cy = hh + ri * cp + cp // 2
-            draw.text((2, cy), self._row_labels[ri], font=font_lbl, anchor="lm", fill=_FG)
-        if has_sep:
-            draw.line([(0, hh + split * cp), (lw, hh + split * cp)], fill=_SEP, width=1)
-
-        if has_sep:
-            sx = lw + split * cp
-            draw.line([(sx, 0), (sx, total_h)], fill=_SEP, width=1)
-            sy = hh + split * cp
-            draw.line([(lw, sy), (total_w, sy)], fill=_SEP, width=1)
-
-        cmap_lut = self._cmap_lut
-        for ri in range(n):
-            pi = proteins[ri]
-            for ci in range(n):
-                pj = proteins[ci]
-                score = sparse.get((min(pi, pj), max(pi, pj)))
-                if score is None:
+    def _recompute_block_buckets(self) -> None:
+        """Collect the raw scores falling into each directed block pair
+        (row block of Protein1, column block of Protein2). Scores outside
+        the cutoff are left out, so aggregates reflect only visible links."""
+        buckets: dict[tuple[int, int], list[float]] = {}
+        if self._block_size > 1:
+            for (pi, pj), score in self._sparse.items():
+                if not self._in_cutoff(score):
                     continue
-                if cmap_lut is not None:
-                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
-                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
-                    x0c, y0c = lw + ci * cp, hh + ri * cp
-                    draw.rectangle([x0c, y0c, x0c + cp - 1, y0c + cp - 1], fill=bg)
-                    if cp >= SCORE_THRESHOLD_PX:
-                        draw.text(
-                            (x0c + cp // 2, y0c + cp // 2),
-                            f"{score:.2f}", font=font_cell, anchor="mm", fill=_auto_fg(bg),
-                        )
-                else:  # greyscale default — no dot symbols
-                    mn, mx = self._min_score, self._max_score
-                    grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
-                    grey_val = max(40, min(200, grey_val))
-                    bg = (grey_val, grey_val, grey_val)
-                    x0c, y0c = lw + ci * cp, hh + ri * cp
-                    draw.rectangle([x0c, y0c, x0c + cp - 1, y0c + cp - 1], fill=bg)
-                    if cp >= SCORE_THRESHOLD_PX:
-                        draw.text(
-                            (x0c + cp // 2, y0c + cp // 2),
-                            f"{score:.2f}", font=font_cell, anchor="mm", fill=_auto_fg(bg),
-                        )
+                bi = self._item_to_block[self._item_index[pi]]
+                bj = self._item_to_block[self._item_index[pj]]
+                buckets.setdefault((bi, bj), []).append(score)
+        self._block_pair_raw = buckets
 
-        return img
+    def _reduce_block_scores(self) -> None:
+        self._block_scores = {k: _aggregate(v, self._agg_method) for k, v in self._block_pair_raw.items()}
+        self._block_pair_n = {k: len(v) for k, v in self._block_pair_raw.items()}
 
-    def _visible_col_blocks(self) -> tuple[int, int]:
-        n = len(self._blocks)
-        cp = self._cell_px
-        x0 = self._mx.canvasx(0)
-        x1 = self._mx.canvasx(self._mx.winfo_width())
-        return max(0, int(x0 // cp)), min(n, int(x1 // cp) + 1)
+    def _block_score(self, rb: int, cb: int) -> float | None:
+        """Score shown in the cell at (row block, column block). Directional:
+        only crosslinks with Protein1 in the row and Protein2 in the column."""
+        if self._block_size <= 1:
+            score = self._sparse.get((self._proteins[rb], self._proteins[cb]))
+            return score if score is not None and self._in_cutoff(score) else None
+        return self._block_scores.get((rb, cb))
 
-    def _visible_row_blocks(self) -> tuple[int, int]:
-        n = len(self._blocks)
-        cp = self._cell_px
-        y0 = self._mx.canvasy(0)
-        y1 = self._mx.canvasy(self._mx.winfo_height())
-        return max(0, int(y0 // cp)), min(n, int(y1 // cp) + 1)
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def _on_click(self, event: tk.Event) -> None:
+        self._select_at(event.x, event.y)
+
+    def _select_at(self, x: int, y: int) -> None:
+        """Select the block under canvas-window pixel (x, y), or clear the selection."""
+        if not self._blocks:
+            return
+        cp, n = self._cell_px, len(self._blocks)
+        cb = (x + int(self._mx.canvasx(0))) // cp
+        rb = (y + int(self._mx.canvasy(0))) // cp
+        if 0 <= rb < n and 0 <= cb < n:
+            self._select_block(rb, cb)
+        else:
+            self._clear_selection()
+        self._schedule()
+
+    def _clear_selection(self) -> None:
+        self._selected = None
+        self._sel_token += 1
+        self._sel_info_var.set("")
+
+    def _select_block(self, rb: int, cb: int) -> None:
+        """Show info for a cell (a 1×1 block) or block, then look the proteins
+        up on UniProt in the background if each side is a single protein."""
+        self._selected = (rb, cb)
+        self._sel_token += 1
+        token = self._sel_token
+        row_items = self._proteins[slice(*self._blocks[rb])]
+        col_items = self._proteins[slice(*self._blocks[cb])]
+        score_line = self._score_line(rb, cb)
+
+        def show(fetched: tuple | None = None) -> None:
+            sides = [self._describe_side(items, fetched[k] if fetched else None, fetched is not None)
+                     for k, items in enumerate((row_items, col_items))]
+            self._sel_info_var.set("\n".join(sides + [score_line]))
+
+        show()
+        if len({protein_of(it) for it in row_items}) == 1 and len({protein_of(it) for it in col_items}) == 1:
+            def fetch() -> None:
+                fetched = tuple(self._fetch_uniprot(short_accession(protein_of(items[0])))
+                                for items in (row_items, col_items))
+                self.after(0, lambda: self._sel_token == token and show(fetched))
+            threading.Thread(target=fetch, daemon=True).start()
+
+    def _describe_side(self, items: list, uniprot: tuple[str, int] | None, fetched: bool) -> str:
+        """One info line for the row or column side of the selection."""
+        decoys = {self._decoy.get(it, False) for it in items}
+        tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
+        sections = {self._section.get(it, "") for it in items} if self._section else set()
+        section = next(iter(sections)) if len(sections) == 1 else ""
+        sec = f"  [{section}]" if section else ""
+
+        if uniprot:
+            name, length = uniprot
+            acc = short_accession(protein_of(items[0]))
+            return f"{name}  ({length} aa, {tag}){sec}{self._pos_range(items)}  [{acc}]"
+        if len(items) > 1:
+            return f"{len(items)} items  (?, {tag}){sec}" if fetched else f"{len(items)} items ({tag}){sec}"
+        protein = protein_of(items[0])
+        if fetched:
+            size = "?"
+        elif protein in self._seqs:
+            size = f"{len(self._seqs[protein])} aa"
+        else:
+            size = "fetching…"
+        return f"{items[0]}  ({size}, {tag}){sec}"
+
+    def _pos_range(self, items: list) -> str:
+        if self._level != "residue":
+            return ""
+        positions = sorted(it.pos for it in items)
+        if len(positions) == 1:
+            return f"  pos {positions[0]}"
+        return f"  pos {positions[0]}-{positions[-1]}"
+
+    def _score_line(self, rb: int, cb: int) -> str:
+        """Scores of both directions: row→col (the clicked cell) and col→row
+        (its mirror cell). On the diagonal both are the same cell."""
+        if rb == cb:
+            return self._direction_score(rb, cb)
+        return (f"row→col {self._direction_score(rb, cb)}   |   "
+                f"col→row {self._direction_score(cb, rb)}")
+
+    def _direction_score(self, rb: int, cb: int) -> str:
+        (r_lo, r_hi), (c_lo, c_hi) = self._blocks[rb], self._blocks[cb]
+        if r_hi - r_lo == 1 and c_hi - c_lo == 1:
+            score = self._sparse.get((self._proteins[r_lo], self._proteins[c_lo]))
+            if score is None:
+                return "(no crosslink)"
+            hidden = "" if self._in_cutoff(score) else " (hidden by cutoff)"
+            return f"score: {score:.4f}{hidden}"
+        score = self._block_scores.get((rb, cb))
+        if score is None:
+            return "(no crosslinks)"
+        n_links = self._block_pair_n.get((rb, cb), 0)
+        return f"{_AGG_NAMES[self._agg_method]} of {n_links} crosslink(s): {score:.4f}"
+
+    def _fetch_uniprot(self, accession: str) -> tuple[str, int] | None:
+        """(recommended full name, sequence length) from UniProt, or None."""
+        if accession in self._uniprot_cache:
+            return self._uniprot_cache[accession]
+        url = f"https://rest.uniprot.org/uniprotkb/{accession}.json"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception:
+            return None
+        name = (data.get("proteinDescription", {})
+                    .get("recommendedName", {})
+                    .get("fullName", {})
+                    .get("value", accession))
+        result = (name, int(data.get("sequence", {}).get("length", 0)))
+        self._uniprot_cache[accession] = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Rendering (visible part only)
+    # ------------------------------------------------------------------
 
     def _redraw(self) -> None:
         self._pending = False
@@ -1026,245 +978,158 @@ class MatrixApp(tk.Tk):
         self._draw_matrix()
 
     def _draw_matrix(self) -> None:
-        c = self._mx
-        w = max(1, c.winfo_width())
-        h = max(1, c.winfo_height())
-        ox = int(c.canvasx(0))
-        oy = int(c.canvasy(0))
-
-        cp = self._cell_px
-        n = len(self._blocks)
-        split = self._split_block
-        has_sep = 0 < split < n
-        c0, c1 = self._visible_col_blocks()
-        r0, r1 = self._visible_row_blocks()
-        proteins = self._proteins
-        sparse = self._sparse
-        thresholds = self._thresholds
-
-        if self._block_size <= 1:
-            def _score_at(rb: int, cb: int) -> Optional[float]:
-                pi, pj = proteins[rb], proteins[cb]
-                return sparse.get((min(pi, pj), max(pi, pj)))
+        if self._pg_screen is not None:
+            self._draw_matrix_pygame()
         else:
-            block_scores = self._block_scores
+            self._draw_matrix_numpy()
 
-            def _score_at(rb: int, cb: int) -> Optional[float]:
-                key = (rb, cb) if rb <= cb else (cb, rb)
-                return block_scores.get(key)
+    def _visible_cells(self):
+        """Yield (x, y, colour, text) for every non-empty visible cell,
+        in canvas-window pixel coordinates."""
+        cp = self._cell_px
+        ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
+        rows, cols = self._visible_blocks()
+        for rb in rows:
+            for cb in cols:
+                score = self._block_score(rb, cb)
+                if score is not None:
+                    yield cb * cp - ox, rb * cp - oy, self._cell_colour(score), self._cell_text(score, cp)
 
-        if _pygame is not None and hasattr(self, "_pg_screen"):
-            if (w, h) != self._pg_size:
-                self._pg_screen = _pygame.display.set_mode((w, h), 0, 32)
-                self._pg_size = (w, h)
+    def _overlay_positions(self) -> tuple[int, int, tuple[int, int] | None]:
+        """Window-pixel x/y of the target/decoy separator (or None when
+        absent) and the top-left of the selected cell."""
+        cp, n = self._cell_px, len(self._blocks)
+        ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
+        split = self._split_block if 0 < self._split_block < n else None
+        sx = split * cp - ox if split is not None else None
+        sy = split * cp - oy if split is not None else None
+        sel = None
+        if self._selected is not None:
+            sel = (self._selected[1] * cp - ox, self._selected[0] * cp - oy)
+        return sx, sy, sel
 
-            screen = self._pg_screen
-            atlas = self._pg_atlas
-            atlas_np_pg = self._atlas   # numpy atlas for colorization of Unicode glyphs
-            score_cache = self._pg_score_cache
-            pg_font = self._pg_font
-            screen.fill(_BG_PG)
+    def _draw_matrix_pygame(self) -> None:
+        w, h = max(1, self._mx.winfo_width()), max(1, self._mx.winfo_height())
+        if (w, h) != self._pg_size:
+            self._pg_screen = _pygame.display.set_mode((w, h), 0, 32)
+            self._pg_size = (w, h)
+        screen, cp = self._pg_screen, self._cell_px
+        screen.fill(_BG)
 
-            cmap_lut = self._cmap_lut
-            for rb in range(r0, r1):
-                row_y = rb * cp - oy
-                for cb in range(c0, c1):
-                    score: Optional[float] = _score_at(rb, cb)
-                    if score is None:
-                        continue
-                    if cmap_lut is not None:
-                        bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
-                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
-                        bg_col = (int(bg[0]), int(bg[1]), int(bg[2]))
-                        show_text = cp >= SCORE_THRESHOLD_PX
-                        score_str = f"{score:.2f}" if show_text else ""
-                        cache_key = ("cm", bg_col, score_str)
-                        cell_surf = score_cache.get(cache_key)
-                        if cell_surf is None:
-                            cell_surf = _pygame.Surface((cp, cp))
-                            cell_surf.fill(bg_col)
-                            if show_text:
-                                fg_col = _auto_fg(bg_col)
-                                ts = pg_font.render(score_str, True, fg_col, bg_col)
-                                cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
-                            score_cache[cache_key] = cell_surf
-                        screen.blit(cell_surf, (cb * cp - ox, row_y))
-                    else:  # greyscale default — no dot symbols
-                        mn, mx = self._min_score, self._max_score
-                        grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
-                        grey_val = max(40, min(200, grey_val))
-                        bg_col = (grey_val, grey_val, grey_val)
-                        show_text = cp >= SCORE_THRESHOLD_PX
-                        score_str = f"{score:.2f}" if show_text else ""
-                        cache_key = ("gs", grey_val, score_str)
-                        cell_surf = score_cache.get(cache_key)
-                        if cell_surf is None:
-                            cell_surf = _pygame.Surface((cp, cp))
-                            cell_surf.fill(bg_col)
-                            if show_text:
-                                fg_col = _auto_fg(bg_col)
-                                ts = pg_font.render(score_str, True, fg_col, bg_col)
-                                cell_surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
-                            score_cache[cache_key] = cell_surf
-                        screen.blit(cell_surf, (cb * cp - ox, row_y))
+        for x, y, colour, text in self._visible_cells():
+            surf = self._pg_cache.get((colour, text))
+            if surf is None:
+                surf = _pygame.Surface((cp, cp))
+                surf.fill(colour)
+                if text:
+                    ts = self._pg_font.render(text, True, _auto_fg(colour), colour)
+                    surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
+                self._pg_cache[(colour, text)] = surf
+            screen.blit(surf, (x, y))
 
-            if has_sep:
-                sx = split * cp - ox
-                _pygame.draw.line(screen, _SEP_PG, (sx, 0), (sx, h))
-                sy = split * cp - oy
-                if 0 <= sy <= h:
-                    _pygame.draw.line(screen, _SEP_PG, (0, sy), (w, sy))
+        sx, sy, sel = self._overlay_positions()
+        if sx is not None:
+            _pygame.draw.line(screen, _SEP, (sx, 0), (sx, h))
+            if 0 <= sy <= h:
+                _pygame.draw.line(screen, _SEP, (0, sy), (w, sy))
+        if sel is not None:
+            _pygame.draw.rect(screen, _HL, (*sel, cp, cp), max(2, cp // 8))
 
-            # Highlight selected cell
-            if self._selected is not None:
-                sel_r, sel_c = self._selected
-                hx = sel_c * cp - ox
-                hy = sel_r * cp - oy
-                lw = max(2, cp // 8)
-                _pygame.draw.rect(screen, _HL, (hx, hy, cp, cp), lw)
+        # SDL owns the mouse inside its window, so clicks arrive here
+        for ev in _pygame.event.get():
+            if ev.type == _pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                self.after(0, lambda p=ev.pos: self._select_at(*p))
 
-            # Process click events before flip
-            for ev in _pygame.event.get():
-                if ev.type == _pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                    col_c = (ev.pos[0] + ox) // cp
-                    row_c = (ev.pos[1] + oy) // cp
-                    if 0 <= row_c < n and 0 <= col_c < n:
-                        self.after(0, lambda r=row_c, c_=col_c: self._on_block_select(r, c_))
-                    else:
-                        self.after(0, self._clear_selection)
+        _pygame.display.flip()
 
-            _pygame.display.flip()
-            return
-
-        atlas_np = self._atlas
-        cmap_lut = self._cmap_lut
+    def _draw_matrix_numpy(self) -> None:
+        c = self._mx
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        cp = self._cell_px
         arr = np.full((h, w, 3), 255, dtype=np.uint8)
-        score_texts: list[tuple] = []  # (cx, cy, label[, fg])
+        texts: list[tuple[int, int, str, tuple[int, int, int]]] = []
 
-        for rb in range(r0, r1):
-            row_y = rb * cp - oy
-            for cb in range(c0, c1):
-                score = _score_at(rb, cb)
-                if score is None:
-                    continue
-                col_x = cb * cp - ox
-                if cmap_lut is not None:
-                    bg = _score_to_bg(score, self._min_score, self._max_score, cmap_lut,
-                                      score_sorted=self._score_sorted if self._norm_mode == "quantile" else None)
-                    iy0 = max(0, row_y); iy1 = min(h, row_y + cp)
-                    ix0 = max(0, col_x); ix1 = min(w, col_x + cp)
-                    if iy1 > iy0 and ix1 > ix0:
-                        arr[iy0:iy1, ix0:ix1] = bg
-                        if cp >= SCORE_THRESHOLD_PX:
-                            score_texts.append((col_x + cp // 2, row_y + cp // 2,
-                                                f"{score:.2f}", _auto_fg(bg)))
-                else:  # greyscale default — no dot symbols
-                    mn, mx = self._min_score, self._max_score
-                    grey_val = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
-                    grey_val = max(40, min(200, grey_val))
-                    bg = (grey_val, grey_val, grey_val)
-                    iy0 = max(0, row_y); iy1 = min(h, row_y + cp)
-                    ix0 = max(0, col_x); ix1 = min(w, col_x + cp)
-                    if iy1 > iy0 and ix1 > ix0:
-                        arr[iy0:iy1, ix0:ix1] = bg
-                        if cp >= SCORE_THRESHOLD_PX:
-                            score_texts.append((col_x + cp // 2, row_y + cp // 2,
-                                                f"{score:.2f}", _auto_fg(bg)))
+        for x, y, colour, text in self._visible_cells():
+            y0, y1 = max(0, y), min(h, y + cp)
+            x0, x1 = max(0, x), min(w, x + cp)
+            if y1 > y0 and x1 > x0:
+                arr[y0:y1, x0:x1] = colour
+                if text:
+                    texts.append((x + cp // 2, y + cp // 2, text, _auto_fg(colour)))
 
         img = Image.fromarray(arr)
         draw = ImageDraw.Draw(img)
+        for cx, cy, text, fg in texts:
+            draw.text((cx, cy), text, font=self._pil_cf, anchor="mm", fill=fg)
 
-        for entry in score_texts:
-            fg_color = entry[3] if len(entry) > 3 else _FG
-            draw.text((entry[0], entry[1]), entry[2], font=self._pil_cf, anchor="mm", fill=fg_color)
-
-        if has_sep:
-            sx = split * cp - ox
+        sx, sy, sel = self._overlay_positions()
+        if sx is not None:
             draw.line([(sx, 0), (sx, h)], fill=_SEP, width=1)
-            sy = split * cp - oy
             if 0 <= sy <= h:
                 draw.line([(0, sy), (w, sy)], fill=_SEP, width=1)
-
-        if self._selected is not None:
-            sel_r, sel_c = self._selected
-            hx = sel_c * cp - ox
-            hy = sel_r * cp - oy
-            lw = max(2, cp // 8)
-            draw.rectangle([hx, hy, hx + cp - 1, hy + cp - 1], outline=_HL, width=lw)
+        if sel is not None:
+            hx, hy = sel
+            draw.rectangle([hx, hy, hx + cp - 1, hy + cp - 1], outline=_HL, width=max(2, cp // 8))
 
         self._mx_photo = ImageTk.PhotoImage(img)
         c.delete("all")
-        c.create_image(ox, oy, image=self._mx_photo, anchor="nw")
+        c.create_image(int(c.canvasx(0)), int(c.canvasy(0)), image=self._mx_photo, anchor="nw")
+
+    def _section_runs(self, first_items: list, split: int):
+        """Yield (start, end, label) for runs of equal section label; runs
+        never cross `split`. first_items[k] is the item that represents slot k."""
+        n = len(first_items)
+        has_sep = 0 < split < n
+        i = 0
+        while i < n:
+            label = self._section.get(first_items[i], "")
+            j = i + 1
+            while j < n and not (has_sep and j == split) and self._section.get(first_items[j], "") == label:
+                j += 1
+            yield i, j, label
+            i = j
 
     def _draw_col_headers(self) -> None:
         c = self._ch_canvas
-        w = max(1, c.winfo_width())
-        h = max(1, self._header_h)
+        w, h = max(1, c.winfo_width()), max(1, self._header_h)
         ox = int(c.canvasx(0))
-
-        cp = self._cell_px
-        lh = self._ch
+        cp, lh, font = self._cell_px, self._ch, self._pil_lf
         n = len(self._blocks)
         split = self._split_block
         has_sep = 0 < split < n
-        c0, c1 = self._visible_col_blocks()
-        pil_lf = self._pil_lf
-        proteins = self._proteins
-        blocks = self._blocks
+        _, cols = self._visible_blocks()
 
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
         y = 0
 
-        # Section label row — walked over blocks; each block is guaranteed
-        # single-section by construction, so adjacent same-label blocks
-        # still merge into one wide, legible span exactly as before
+        # section label row (every block is single-section by construction)
         if self._section is not None:
-            i = 0
-            while i < n:
-                label = self._section.get(proteins[blocks[i][0]], "")
-                j = i + 1
-                while j < n:
-                    if has_sep and j == split:
-                        break
-                    if self._section.get(proteins[blocks[j][0]], "") != label:
-                        break
-                    j += 1
-                x0s = i * cp - ox
-                x1s = j * cp - ox
-                if x1s > 0 and x0s < w and label:
-                    mid = (x0s + x1s) // 2
-                    draw.text((mid, y + lh // 2), label, font=pil_lf, anchor="mm", fill=_FG)
-                    draw.rectangle([x0s, y, x1s - 1, y + lh - 1], outline=_SEP)
-                i = j
+            first_items = [self._proteins[s] for s, _ in self._blocks]
+            for i, j, label in self._section_runs(first_items, split):
+                x0, x1 = i * cp - ox, j * cp - ox
+                if x1 > 0 and x0 < w and label:
+                    draw.text(((x0 + x1) // 2, y + lh // 2), label, font=font, anchor="mm", fill=_FG)
+                    draw.rectangle([x0, y, x1 - 1, y + lh - 1], outline=_SEP)
             y += lh
 
-        # Vertical separator in header
         if has_sep:
-            sx = split * cp - ox
-            draw.line([(sx, 0), (sx, h)], fill=_SEP, width=1)
+            draw.line([(split * cp - ox, 0), (split * cp - ox, h)], fill=_SEP, width=1)
 
-        # Stacked chars — only for single-item blocks; a multi-item block's
-        # per-char label would misleadingly suggest the whole block is one item
+        # vertical labels — only for single-item blocks; a character label on a
+        # multi-item block would suggest the whole block is one item
         labels = self._col_labels
-        max_len = max((len(lb) for lb in labels), default=0)
-        for char_idx in range(max_len):
-            for cb in range(c0, c1):
-                s, e = blocks[cb]
-                if e - s != 1:
-                    continue
-                lb = labels[s]
-                ch = lb[char_idx] if char_idx < len(lb) else " "
-                if ch != " ":
-                    cx = cb * cp + cp // 2 - ox
-                    draw.text((cx, y + lh // 2), ch, font=pil_lf, anchor="mm", fill=_FG)
+        for char_idx in range(max((len(lb) for lb in labels), default=0)):
+            for cb in cols:
+                s, e = self._blocks[cb]
+                if e - s == 1 and char_idx < len(labels[s]) and labels[s][char_idx] != " ":
+                    draw.text((cb * cp + cp // 2 - ox, y + lh // 2), labels[s][char_idx],
+                              font=font, anchor="mm", fill=_FG)
             y += lh
 
-        # Horizontal rule
         draw.line([(0, y), (w, y)], fill=_SEP, width=1)
         if has_sep:
-            sx = split * cp - ox
-            draw.text((sx, y), "+", font=pil_lf, anchor="mm", fill=_SEP)
+            draw.text((split * cp - ox, y), "+", font=font, anchor="mm", fill=_SEP)
 
         self._ch_photo = ImageTk.PhotoImage(img)
         c.delete("all")
@@ -1272,48 +1137,122 @@ class MatrixApp(tk.Tk):
 
     def _draw_row_labels(self) -> None:
         c = self._rl_canvas
-        w = max(1, self._label_w)
-        h = max(1, c.winfo_height())
+        w, h = max(1, self._label_w), max(1, c.winfo_height())
         oy = int(c.canvasy(0))
-
         cp = self._cell_px
         n = len(self._blocks)
         split = self._split_block
-        has_sep = 0 < split < n
-        r0, r1 = self._visible_row_blocks()
-        pil_lf = self._pil_lf
-        lh = self._ch
-        proteins = self._proteins
-        blocks = self._blocks
+        rows, _ = self._visible_blocks()
 
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
-
-        for rb in range(r0, r1):
-            s, e = blocks[rb]
-            cy = rb * cp + cp // 2 - oy
+        for rb in rows:
+            s, e = self._blocks[rb]
             if e - s == 1:
                 label = self._row_labels[s]
-            elif self._section is not None:
-                label = self._section.get(proteins[s], "")
-            else:
-                label = ""
+            else:  # multi-item block: show its section name, if any
+                label = self._section.get(self._proteins[s], "") if self._section is not None else ""
             if label:
-                draw.text((2, cy), label, font=pil_lf, anchor="lm", fill=_FG)
+                draw.text((2, rb * cp + cp // 2 - oy), label, font=self._pil_lf, anchor="lm", fill=_FG)
 
-        if has_sep:
-            sy = split * cp - oy
-            if 0 <= sy <= h:
-                draw.line([(0, sy), (w, sy)], fill=_SEP, width=1)
+        if 0 < split < n and 0 <= split * cp - oy <= h:
+            draw.line([(0, split * cp - oy), (w, split * cp - oy)], fill=_SEP, width=1)
 
         self._rl_photo = ImageTk.PhotoImage(img)
         c.delete("all")
         c.create_image(0, oy, image=self._rl_photo, anchor="nw")
 
+    # ------------------------------------------------------------------
+    # PNG export (full matrix, one cell per item, no aggregation, cutoff applied)
+    # ------------------------------------------------------------------
+
+    def _export(self) -> None:
+        if not self._proteins:
+            messagebox.showerror("Export", "No data loaded.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".png", filetypes=[("PNG image", "*.png")],
+            title="Export Matrix as PNG",
+        )
+        if not path:
+            return
+        self._status_var.set("Exporting…")
+        threading.Thread(target=self._export_worker, args=(path,), daemon=True).start()
+
+    def _export_worker(self, path: str) -> None:
+        try:
+            self._render_full_image().save(path)
+            name = os.path.basename(path)
+            self.after(0, lambda: self._status_var.set(f"Exported → {name}"))
+        except Exception as exc:
+            msg = str(exc)
+            self.after(0, lambda: self._status_var.set(f"Export failed: {msg}"))
+
+    def _render_full_image(self) -> Image.Image:
+        cp = min(self._cell_px, 16)
+        items = self._proteins
+        n = len(items)
+        split = self._split
+        has_sep = 0 < split < n
+
+        font_lbl = _find_pil_font(LABEL_FONT_SIZE + 2)
+        font_cell = _find_pil_font(max(6, cp - 2))
+        lh, lw = self._ch, self._label_w
+        hh = ((1 if self._section else 0) + COL_W + 1) * lh + 2
+        total_w, total_h = lw + n * cp, hh + n * cp
+
+        img = Image.new("RGB", (total_w, total_h), _BG)
+        draw = ImageDraw.Draw(img)
+
+        # column headers: section row, then vertical labels
+        y = 0
+        if self._section is not None:
+            for i, j, label in self._section_runs(items, split):
+                x0, x1 = lw + i * cp, lw + j * cp
+                if label:
+                    draw.text(((x0 + x1) // 2, y + lh // 2), label, font=font_lbl, anchor="mm", fill=_FG)
+                    draw.rectangle([x0, y, x1 - 1, y + lh - 1], outline=_SEP)
+            y += lh
+        labels = self._col_labels
+        for char_idx in range(max((len(lb) for lb in labels), default=0)):
+            for ci, lb in enumerate(labels):
+                if char_idx < len(lb) and lb[char_idx] != " ":
+                    draw.text((lw + ci * cp + cp // 2, y + lh // 2), lb[char_idx],
+                              font=font_lbl, anchor="mm", fill=_FG)
+            y += lh
+        draw.line([(lw, y), (total_w, y)], fill=_SEP, width=1)
+        if has_sep:
+            draw.text((lw + split * cp, y), "+", font=font_lbl, anchor="mm", fill=_SEP)
+
+        # row labels
+        for ri in range(n):
+            draw.text((2, hh + ri * cp + cp // 2), self._row_labels[ri], font=font_lbl, anchor="lm", fill=_FG)
+
+        # target/decoy separators
+        if has_sep:
+            sx, sy = lw + split * cp, hh + split * cp
+            draw.line([(0, sy), (lw, sy)], fill=_SEP, width=1)
+            draw.line([(sx, 0), (sx, total_h)], fill=_SEP, width=1)
+            draw.line([(lw, sy), (total_w, sy)], fill=_SEP, width=1)
+
+        # cells
+        for ri, pi in enumerate(items):
+            for ci, pj in enumerate(items):
+                score = self._sparse.get((pi, pj))
+                if score is None or not self._in_cutoff(score):
+                    continue
+                colour = self._cell_colour(score)
+                x0, y0 = lw + ci * cp, hh + ri * cp
+                draw.rectangle([x0, y0, x0 + cp - 1, y0 + cp - 1], fill=colour)
+                text = self._cell_text(score, cp)
+                if text:
+                    draw.text((x0 + cp // 2, y0 + cp // 2), text, font=font_cell, anchor="mm",
+                              fill=_auto_fg(colour))
+        return img
+
 
 def main() -> None:
-    initial = sys.argv[1] if len(sys.argv) > 1 else None
-    MatrixApp(initial).mainloop()
+    MatrixApp(sys.argv[1] if len(sys.argv) > 1 else None).mainloop()
 
 
 if __name__ == "__main__":

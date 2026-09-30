@@ -1,23 +1,42 @@
 """Fetch biological groupings from KEGG (pathways) or STRING DB (complexes) and
 return a reordered protein list so proteins sharing a pathway or complex end up
 next to each other, along with a per-protein section label. Used by print_matrix.py
-via order_by_kegg() and order_by_string()."""
+via order_by_kegg() and order_by_string().
+
+Downloads are cached as JSON under ~/.cache/xlms_matrix/."""
 from __future__ import annotations
 
 import json
-import os
 import time
 import urllib.parse
 import urllib.request
 import warnings
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 _CACHE_ROOT = Path.home() / ".cache" / "xlms_matrix"
+_USER_AGENT = {"User-Agent": "xlms-matrix/1.0"}
 
 
-def _cache_path(species: str, name: str) -> Path:
-    p = _CACHE_ROOT / str(species)
+def short_accession(name: str) -> str:
+    """Strip XL-MS protein names to a bare identifier for database queries.
+    sp|P12345|PROT_HUMAN desc  ->  P12345
+    P12345                     ->  P12345
+    PROT_HUMAN                 ->  PROT_HUMAN
+    """
+    parts = name.split("|")
+    if len(parts) >= 2:  # UniProt FASTA style 'sp|ACC|ENTRY desc' or 'tr|ACC|ENTRY desc'
+        return parts[1].strip()
+    return name.split()[0].strip()
+
+
+# --------------------------------------------------------------------------
+# HTTP + disk cache
+# --------------------------------------------------------------------------
+
+def _cache_path(folder: str, name: str) -> Path:
+    p = _CACHE_ROOT / folder
     p.mkdir(parents=True, exist_ok=True)
     return p / name
 
@@ -35,65 +54,61 @@ def _save_cache(path: Path, data: dict) -> None:
 
 
 def _get(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": "xlms-matrix/1.0"})
+    req = urllib.request.Request(url, headers=_USER_AGENT)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8")
 
 
 def _post(url: str, data: dict) -> list:
     encoded = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(url, data=encoded, headers={"User-Agent": "xlms-matrix/1.0"})
+    req = urllib.request.Request(url, data=encoded, headers=_USER_AGENT)
     with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _parse_identifier(name: str) -> str:
-    """
-    Strip XL-MS protein names to a bare identifier for database queries.
-    sp|P12345|PROT_HUMAN desc  ->  P12345
-    P12345                     ->  P12345
-    PROT_HUMAN                 ->  PROT_HUMAN
-    """
-    # UniProt FASTA headers look like 'sp|ACC|ENTRY desc' or 'tr|ACC|ENTRY desc'
-    if "|" in name:
-        parts = name.split("|")
-        if len(parts) >= 2:
-            return parts[1].strip()
-    return name.split()[0].strip()
+# --------------------------------------------------------------------------
+# Grouping shared by KEGG and STRING
+# --------------------------------------------------------------------------
 
-
-def _cluster_by_memberships(
-    group: list[str],
+def _assign_primary_groups(
+    proteins: list[str],
     memberships: dict[str, set[str]],
-) -> list[str]:
-    """
-    Given a dict of {protein: {term_id, ...}}, cluster proteins by shared
-    term co-membership and return them in dendrogram leaf order.
-    Proteins with no memberships are appended at the end.
-    """
-    import numpy as np
-    from scipy.cluster.hierarchy import leaves_list, linkage
-    from scipy.spatial.distance import squareform
+    name_map: dict[str, str],
+    max_groups: int = 10,
+) -> dict[str, str]:
+    """Assign each protein to exactly one named section: take the max_groups
+    terms shared by the most proteins, give each protein its highest-ranked
+    matching term, and "Unknown" if none match."""
+    term_counts = Counter(term for p in proteins for term in memberships.get(p, set()))
+    top_terms = [term for term, _ in term_counts.most_common(max_groups)]
 
-    present = [p for p in group if memberships.get(p)]
-    absent  = [p for p in group if not memberships.get(p)]
+    assignment: dict[str, str] = {}
+    for protein in proteins:
+        terms = memberships.get(protein, set())
+        match = next((t for t in top_terms if t in terms), None)
+        assignment[protein] = "Unknown" if match is None else name_map.get(match, match)
+    return assignment
 
-    if len(present) < 2:
-        return present + absent
 
-    n = len(present)
-    co = np.zeros((n, n))
-    for i, pi in enumerate(present):
-        for j, pj in enumerate(present):
-            co[i, j] = len(memberships[pi] & memberships[pj])
+def _group_and_sort(proteins: list[str], assignment: dict[str, str]) -> list[str]:
+    """Largest section first, "Unknown" last, input order kept within a section."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for p in proteins:
+        groups[assignment[p]].append(p)
+    sections = sorted((s for s in groups if s != "Unknown"), key=lambda s: -len(groups[s]))
+    if "Unknown" in groups:
+        sections.append("Unknown")
+    return [p for s in sections for p in groups[s]]
 
-    max_co = co.max() or 1.0
-    D = max_co - co
-    np.fill_diagonal(D, 0.0)
-    Z = linkage(squareform(D), method="average")
-    order = leaves_list(Z)
-    return [present[i] for i in order] + absent
 
+def _order_by_memberships(proteins, memberships, term_names):
+    assignment = _assign_primary_groups(proteins, memberships, term_names)
+    return _group_and_sort(proteins, assignment), assignment
+
+
+# --------------------------------------------------------------------------
+# KEGG
+# --------------------------------------------------------------------------
 
 _NCBI_TO_KEGG: dict[int, str] = {
     9606:  "hsa",   # Homo sapiens
@@ -110,177 +125,87 @@ _NCBI_TO_KEGG: dict[int, str] = {
 def _ncbi_to_kegg_code(taxid: int) -> str:
     if taxid in _NCBI_TO_KEGG:
         return _NCBI_TO_KEGG[taxid]
-    # Query KEGG for unknown species
-    text = _get("https://rest.kegg.jp/list/organism")
-    for line in text.splitlines():
+    # unknown species: look it up in KEGG's organism list
+    for line in _get("https://rest.kegg.jp/list/organism").splitlines():
         parts = line.split("\t")
         if len(parts) >= 4 and str(taxid) in parts[3]:
             return parts[1]
     raise ValueError(f"KEGG organism code not found for NCBI taxid {taxid}")
 
 
-def _kegg_load_uniprot_map(org: str) -> dict[str, str]:
-    """
-    Download (and cache) the full UniProt accession → KEGG gene ID map for org.
-    Uses https://rest.kegg.jp/conv/{org}/uniprot — a single request for all proteins.
-    """
-    cache_file = _cache_path(f"{org}_kegg", "uniprot_map.json")
+def _cached_kegg_table(
+    org: str,
+    cache_name: str,
+    endpoint: str,
+    what: str,
+    build: Callable[[list[list[str]]], dict],
+) -> dict:
+    """Download a KEGG tab-separated table once per organism, turn its rows
+    (only those with >= 2 fields) into a dict with `build`, and cache it."""
+    cache_file = _cache_path(f"{org}_kegg", cache_name)
     cached = _load_cache(cache_file)
     if cached is not None:
         return cached
 
-    print(f"[KEGG] Downloading UniProt→gene map for {org} (one-time, will be cached)…")
-    text = _get(f"https://rest.kegg.jp/conv/{org}/uniprot")
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            # parts[0] = "up:P12345", parts[1] = "bta:280705"
-            uniprot_acc = parts[0].strip().removeprefix("up:")
-            kegg_gene   = parts[1].strip()
-            result[uniprot_acc] = kegg_gene
-
+    print(f"[KEGG] Downloading {what} for {org} (one-time, will be cached)…")
+    text = _get(f"https://rest.kegg.jp/{endpoint}")
+    rows = [parts for parts in (line.split("\t") for line in text.splitlines()) if len(parts) >= 2]
+    result = build(rows)
     _save_cache(cache_file, result)
     return result
 
 
-def _kegg_load_pathway_map(org: str) -> dict[str, list[str]]:
-    """
-    Download (and cache) the full KEGG gene ID → pathway IDs map for org.
-    Uses https://rest.kegg.jp/link/pathway/{org} — a single request.
-    """
-    cache_file = _cache_path(f"{org}_kegg", "pathway_map.json")
-    cached = _load_cache(cache_file)
-    if cached is not None:
-        return cached
+def _uniprot_to_gene(rows):
+    # "up:P12345" -> "bta:280705"
+    return {r[0].strip().removeprefix("up:"): r[1].strip() for r in rows}
 
-    print(f"[KEGG] Downloading gene→pathway map for {org} (one-time, will be cached)…")
-    text = _get(f"https://rest.kegg.jp/link/pathway/{org}")
+
+def _gene_to_pathways(rows):
     result: dict[str, list[str]] = {}
-    for line in text.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            gene_id    = parts[0].strip()
-            pathway_id = parts[1].strip()
-            result.setdefault(gene_id, []).append(pathway_id)
-
-    _save_cache(cache_file, result)
+    for r in rows:
+        result.setdefault(r[0].strip(), []).append(r[1].strip())
     return result
 
 
-def _kegg_load_pathway_names(org: str) -> dict[str, str]:
-    """
-    Download (and cache) human-readable pathway names for the organism.
-    Uses https://rest.kegg.jp/list/pathway/{org} — a single request.
-    Returns {pathway_id: display_name}, e.g. {"path:hsa00010": "Glycolysis / Gluconeogenesis"}.
-    """
-    cache_file = _cache_path(f"{org}_kegg", "pathway_names.json")
-    cached = _load_cache(cache_file)
-    if cached is not None:
-        return cached
-
-    print(f"[KEGG] Downloading pathway names for {org} (one-time, will be cached)…")
-    text = _get(f"https://rest.kegg.jp/list/pathway/{org}")
-    result: dict[str, str] = {}
-    for line in text.splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            pathway_id   = parts[0].strip()
-            # "Glycolysis / Gluconeogenesis - Homo sapiens (human)" → first part only
-            display_name = parts[1].split(" - ")[0].strip()
-            result[pathway_id] = display_name
-
-    _save_cache(cache_file, result)
-    return result
-
-
-def _assign_primary_groups(
-    proteins: list[str],
-    memberships: dict[str, set[str]],
-    name_map: dict[str, str],
-    max_groups: int = 10,
-) -> dict[str, str]:
-    """
-    Assign each protein to exactly one named section for display.
-    Picks the top max_groups terms by number of matching selected proteins,
-    then greedily assigns each protein to its highest-ranked matching term.
-    Proteins with no match are assigned to "Unknown".
-    Returns {protein_name: section_display_label}.
-    """
-    from collections import Counter
-    term_counts = Counter(term for p in proteins for term in memberships.get(p, set()))
-    top_terms = [term for term, _ in term_counts.most_common(max_groups)]
-
-    assignment: dict[str, str] = {}
-    for protein in proteins:
-        pws = memberships.get(protein, set())
-        for term in top_terms:
-            if term in pws:
-                assignment[protein] = name_map.get(term, term)
-                break
-        else:
-            assignment[protein] = "Unknown"
-    return assignment
-
-
-def _group_and_sort(
-    proteins: list[str],
-    assignment: dict[str, str],
-) -> list[str]:
-    """
-    Order proteins by their section (largest section first, Unknown last),
-    preserving the original order within each section.
-    """
-    from collections import defaultdict
-    groups: dict[str, list[str]] = defaultdict(list)
-    for p in proteins:
-        groups[assignment[p]].append(p)
-
-    section_order = sorted(
-        [s for s in groups if s != "Unknown"],
-        key=lambda s: -len(groups[s]),
-    )
-    if "Unknown" in groups:
-        section_order.append("Unknown")
-
-    return [p for s in section_order for p in groups[s]]
+def _pathway_names(rows):
+    # "Glycolysis / Gluconeogenesis - Homo sapiens (human)" -> first part only
+    return {r[0].strip(): r[1].split(" - ")[0].strip() for r in rows}
 
 
 def order_by_kegg(proteins: list[str], species: int = 9606) -> tuple[list[str], dict[str, str]]:
-    """
-    Order proteins so those sharing KEGG pathways appear adjacent.
-    Downloads org-wide mapping tables once and caches them to disk.
-    Returns (ordered_proteins, {protein: section_label}).
-    """
+    """Order proteins so those sharing KEGG pathways appear adjacent.
+    Returns (ordered_proteins, {protein: section_label})."""
     org = _ncbi_to_kegg_code(species)
-    uniprot_map   = _kegg_load_uniprot_map(org)    # {uniprot_acc: kegg_gene_id}
-    pathway_map   = _kegg_load_pathway_map(org)    # {kegg_gene_id: [pathway_ids]}
-    pathway_names = _kegg_load_pathway_names(org)  # {pathway_id: display_name}
+    uniprot_map = _cached_kegg_table(org, "uniprot_map.json", f"conv/{org}/uniprot",
+                                     "UniProt→gene map", _uniprot_to_gene)
+    pathway_map = _cached_kegg_table(org, "pathway_map.json", f"link/pathway/{org}",
+                                     "gene→pathway map", _gene_to_pathways)
+    pathway_names = _cached_kegg_table(org, "pathway_names.json", f"list/pathway/{org}",
+                                       "pathway names", _pathway_names)
 
     memberships: dict[str, set[str]] = {}
     for protein in proteins:
-        identifier = _parse_identifier(protein)
+        identifier = short_accession(protein)
         gene_id = uniprot_map.get(identifier)
-        if gene_id:
-            memberships[protein] = set(pathway_map.get(gene_id, []))
-        else:
-            memberships[protein] = set()
+        memberships[protein] = set(pathway_map.get(gene_id, [])) if gene_id else set()
+        if not gene_id:
             warnings.warn(
                 f"KEGG: '{protein}' (id: '{identifier}') not in {org} UniProt map"
                 " — appended at end"
             )
+    return _order_by_memberships(proteins, memberships, pathway_names)
 
-    assignment = _assign_primary_groups(proteins, memberships, pathway_names)
-    ordered    = _group_and_sort(proteins, assignment)
-    return ordered, assignment
 
+# --------------------------------------------------------------------------
+# STRING
+# --------------------------------------------------------------------------
 
 _STRING_BASE = "https://string-db.org/api/json"
 _STRING_COMPLEX_CATEGORIES = {"CORUM", "PPI_hub_proteins", "KEGG_Pathways"}
 
 
 def _string_resolve_ids(identifiers: list[str], taxid: int) -> dict[str, str]:
-    """Return {input_name: string_id} mapping."""
+    """Return {input_name: string_id}."""
     try:
         results = _post(f"{_STRING_BASE}/get_string_ids", {
             "identifiers": "\r".join(identifiers),
@@ -309,55 +234,45 @@ def _string_fetch_enrichment(string_ids: list[str], taxid: int) -> list[dict]:
 
 
 def order_by_string(proteins: list[str], species: int = 9606) -> tuple[list[str], dict[str, str]]:
-    """
-    Order proteins so those sharing STRING complex / pathway annotations appear
-    adjacent. Uses two batch HTTP calls total, with local disk caching.
-    Returns (ordered_proteins, {protein: section_label}).
-    """
-    cache_file      = _cache_path(f"{species}_string", "complexes.json")
+    """Order proteins so those sharing STRING complex / pathway annotations
+    appear adjacent. Two batch HTTP calls for uncached proteins.
+    Returns (ordered_proteins, {protein: section_label})."""
+    cache_file = _cache_path(f"{species}_string", "complexes.json")
     names_cache_file = _cache_path(f"{species}_string", "term_names.json")
-    cache: dict[str, list[str]] = _load_cache(cache_file) or {}
-    term_names: dict[str, str]  = _load_cache(names_cache_file) or {}
+    cache: dict[str, list[str]] = _load_cache(cache_file) or {}      # bare id -> terms
+    term_names: dict[str, str] = _load_cache(names_cache_file) or {}
 
-    identifiers = [_parse_identifier(p) for p in proteins]
-    id_map = dict(zip(proteins, identifiers))  # protein -> bare identifier
-    to_resolve = [p for p in proteins if id_map[p] not in cache]
+    bare = {p: short_accession(p) for p in proteins}
+    to_resolve = [p for p in proteins if bare[p] not in cache]
 
     if to_resolve:
-        string_ids_map = _string_resolve_ids([id_map[p] for p in to_resolve], species)
+        string_ids = _string_resolve_ids([bare[p] for p in to_resolve], species)
         time.sleep(1)
 
-        if string_ids_map:
-            enrichment = _string_fetch_enrichment(list(string_ids_map.values()), species)
+        if string_ids:
+            enrichment = _string_fetch_enrichment(list(string_ids.values()), species)
             time.sleep(1)
 
-            string_memberships: dict[str, set[str]] = {sid: set() for sid in string_ids_map.values()}
+            terms_of: dict[str, set[str]] = {sid: set() for sid in string_ids.values()}
             for record in enrichment:
-                if record.get("category") in _STRING_COMPLEX_CATEGORIES:
-                    term = record["term"]
-                    desc = record.get("description") or term
-                    term_names[term] = desc
-                    for gene in record.get("inputGenes", "").split(","):
-                        gene = gene.strip()
-                        for sid in string_ids_map.values():
-                            if sid.endswith(gene) or gene in sid:
-                                string_memberships[sid].add(term)
+                if record.get("category") not in _STRING_COMPLEX_CATEGORIES:
+                    continue
+                term = record["term"]
+                term_names[term] = record.get("description") or term
+                for gene in record.get("inputGenes", "").split(","):
+                    gene = gene.strip()
+                    for sid in string_ids.values():
+                        if sid.endswith(gene) or gene in sid:
+                            terms_of[sid].add(term)
 
             for protein in to_resolve:
-                bare = id_map[protein]
-                if bare in string_ids_map:
-                    sid = string_ids_map[bare]
-                    cache[bare] = sorted(string_memberships.get(sid, set()))
-                else:
-                    cache[bare] = []
+                sid = string_ids.get(bare[protein])
+                cache[bare[protein]] = [] if sid is None else sorted(terms_of.get(sid, set()))
+                if sid is None:
                     warnings.warn(f"STRING: no entry found for '{protein}' — appended at end")
 
         _save_cache(cache_file, cache)
         _save_cache(names_cache_file, term_names)
 
-    memberships: dict[str, set[str]] = {
-        p: set(cache.get(id_map[p], [])) for p in proteins
-    }
-    assignment = _assign_primary_groups(proteins, memberships, term_names)
-    ordered    = _group_and_sort(proteins, assignment)
-    return ordered, assignment
+    memberships = {p: set(cache.get(bare[p], [])) for p in proteins}
+    return _order_by_memberships(proteins, memberships, term_names)

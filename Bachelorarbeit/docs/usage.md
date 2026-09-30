@@ -33,6 +33,16 @@ pip install pandas biopython scipy numpy Pillow matplotlib pygame
 - **FASTA** (optional) — protein sequences, used by `--order sequence`,
   `--order size`, and the GUI's per-protein length lookup.
 
+## Matrix orientation
+
+The matrix is **directional, not symmetric**: each CSV row is drawn in the
+cell at **row = `Protein1`, column = `Protein2`**. A row `A,B,x` fills cell
+(row A, column B); a row `B,A,y` fills cell (row B, column A). A–B and B–A
+are never merged, so a pair that only appears one way round in the CSV
+fills only one of the two mirrored cells. If the same direction appears in
+several rows, the highest score is shown. In residue mode the same applies
+to the two residues of a row.
+
 An example CSV is provided at `data/example_500.csv`. It only has
 `Protein1`/`Protein2`/`Score` columns, so `--level residue` isn't available
 on it — use it for protein-level mode only.
@@ -56,14 +66,13 @@ python scripts/print_matrix.py <csv_path> [options]
 
 - `confidence` — highest-scoring proteins first (default)
 - `alpha` — alphabetical
-- `cluster` — hierarchical clustering by crosslink score similarity
 - `sequence` — hierarchical clustering by k-mer similarity (needs `--fasta`)
 - `pathway` — grouped by KEGG pathway (needs `--species`)
 - `complex` — grouped by STRING complex/pathway (needs `--species`)
 - `size` — longest sequence first (needs `--fasta` for real lengths)
 
 In `--level residue` mode, every `--order` mode above is applied to each
-residue's *parent protein* (so pathway/complex/cluster/etc. group residues
+residue's *parent protein* (so pathway/complex/etc. group residues
 the same way they'd group whole proteins), and residues within a protein are
 then sorted by position. Protein-name section headers are always shown above
 the columns in residue mode, regardless of `--order`.
@@ -75,7 +84,7 @@ python scripts/print_matrix.py data/links.csv
 python scripts/print_matrix.py data/links.csv --n 200 --order alpha
 python scripts/print_matrix.py data/links.csv --order sequence --fasta data/proteins.fasta
 python scripts/print_matrix.py data/links.csv --order pathway --species 9913
-python scripts/print_matrix.py data/links.csv --level residue --order cluster
+python scripts/print_matrix.py data/links.csv --level residue --order alpha
 ```
 
 Output is a dot-matrix printed to the console (targets before decoys, split
@@ -135,27 +144,48 @@ python scripts/print_matrix.py residues.csv --level residue
 python gui/matrix_app.py [csv_path]
 ```
 
-Opens a Tkinter window with the same CSV/FASTA/`--level`/`--n`/`--order`/
-`--species` controls as the CLI, plus:
+Opens a Tkinter window. All controls sit in a panel on the left, so the
+matrix uses the full window height; the panel scrolls (mouse wheel over it)
+if the window is too short to show everything. The panel has four groups:
+
+**Data** — the same CSV/FASTA/`--level`/`--n`/`--order`/`--species`
+options as the CLI, plus **Load**, **Export PNG…** and the load status.
 
 - **Level** — `protein` (default) or `residue`; switches the axis unit and
   updates the `N` label accordingly. Requires the CSV to have residue-
   position columns (see above).
-- **Show only linked residues** — checkbox next to Level, enabled only in
-  residue mode. Checked (default) matches the CLI default: only crosslinked
-  residues are shown. Unchecking it requires a FASTA file and adds every
-  other residue of each protein already in the matrix, same as
-  `--include-unlinked`.
-- **Zoom** slider — cell size in pixels; past a threshold, cells show the
-  numeric score instead of a dot.
+- **Show only linked residues** — enabled only in residue mode. Checked
+  (default) matches the CLI default: only crosslinked residues are shown.
+  Unchecking it requires a FASTA file and adds every other residue of each
+  protein already in the matrix, same as `--include-unlinked`.
+- **Export PNG…** — renders the full (unscrolled, un-aggregated) matrix to a
+  PNG file, with the score cutoff applied.
+
+**Display**
+
 - **Colormap** — `(none)` for greyscale, or a matplotlib colormap (e.g.
   `coolwarm`) if matplotlib is installed.
 - **Norm** — linear or quantile score normalization for the colormap.
-- Click a cell to see both proteins' names, decoy status, section (if
-  pathway/complex ordering is active), and the crosslink score — in residue
-  mode, also the residue position. This also triggers a background UniProt
-  lookup for the full protein name and length.
-- **Export PNG…** — renders the full (unscrolled) matrix to a PNG file.
+- **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
+  score. Zooming below 4 px merges neighbouring items into blocks.
+- **Aggregate** — how a block's scores are combined: mean, geometric mean
+  or max.
+
+**Score cutoff** — one slider with two handles: the left handle is the
+bottom limit, the right handle the top limit (both inclusive). Cells whose
+score is outside the range are hidden; they are also left out of block
+aggregates and of the PNG export. Colours keep the full-range scale, so a
+score has the same colour whatever the cutoff. The label shows the range and
+how many links are visible; **Reset** restores the full range. Loading new
+data resets the cutoff.
+
+**Selection** — click a cell to see both proteins' names, decoy status,
+section (if pathway/complex ordering is active), and the crosslink scores in
+both directions: `row→col` (the clicked cell) and `col→row` (its mirror
+cell) — in residue mode, also the residue position. A cell hidden by the
+cutoff shows its score marked `(hidden by cutoff)`. When zoomed out into
+blocks, the aggregated score of each direction is shown. Clicking also
+triggers a background UniProt lookup for the full protein name and length.
 
 If `pygame` is installed, the matrix canvas renders through an embedded SDL2
 surface for smoother scrolling on large matrices; otherwise it falls back to
