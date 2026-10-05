@@ -161,7 +161,7 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
   **Display** (Colormap, Norm, Zoom, Aggregate), **Score cutoff** (RangeSlider, label, Reset),
   **Selection** (wrapped info text); footer = item count + renderer. No top bar / status bar any more
   (added 2026-09-30 on user request: bigger matrix area). Matrix grid packs to the right of it.
-  `_init_pygame` embeds SDL via `SDL_WINDOWID`; `_pg_loop` redraws every 16 ms.
+  `_init_pygame` embeds SDL via `SDL_WINDOWID`. pygame renders into an off-screen `_pg_frame` only from `_redraw` (real changes); `_pg_loop` (16 ms) just polls pygame events (`_poll_pygame_events`: left click → `_select_at`) and re-shows the frame via `_present()` (~0.4 ms; `_pg_sync_size` handles resize). Render errors go to `_report_render_error` (stderr + status line, once per message). Tk `<MouseWheel>` works over the SDL window (verified with real OS input), no forwarding needed.
 - **Score cutoff** (user request 2026-09-30): `_cut_lo/_cut_hi` (reset to min/max score on each load),
   `_in_cutoff(score)` inclusive. Applied in `_block_score` (single cells), `_recompute_block_buckets`
   (filtered *before* aggregation, so counts/aggregates only use visible links), `_render_full_image`,
@@ -252,7 +252,7 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 4. Two CSV readers with different contracts (§4.2) — intentional for now.
 5. `_build` may return **N+1** items (adds both ends of a row before checking `>= n`).
 6. ppi-level files and `example_500.csv` give triangular matrices (each pair listed once) — expected.
-7. GUI pygame path redraws every 16 ms even when idle; `_pg_loop` swallows exceptions silently.
+7. (FIXED 2026-09-30) pygame idle loop used to rebuild the frame every 16 ms (34–72 % main thread busy while idle) and swallow errors; now idle cost ≈ 0 redraws, errors reported.
 8. Export ignores block aggregation, never shows score text; very large N → huge PNG.
 9. STRING gene matching is substring-based → possible false memberships.
 10. Residue-mode CLI section headers render as `==` for proteins with 1–2 residues (by design).
@@ -263,7 +263,7 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 14. **N spinbox:** non-numeric N → `self._n_var.get()` raises TclError in `_load` (uncaught, silent).
 15. Clicking the matrix doesn't `focus_set()` it → arrow keys stop working after using a sidebar field.
 16. Scrolling perf measured: at 4 px a scroll step costs ~100–135 ms (per-cell Python loops +
-    per-char PIL header text), pygame idle loop rebuilds the frame every 16 ms; Tk canvas scrolling
+    per-char PIL header text), (pygame idle loop fixed separately); Tk canvas scrolling
     exposes white strips. A fix plan (own scroll offsets + vectorised frame + cached glyphs) was drafted
     but NOT implemented — user redirected to a whole-project review.
 12. `__pycache__` binaries are committed to git. Python files written by Claude use LF; git autocrlf converts.
@@ -305,3 +305,20 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 - Possible next topics (unconfirmed): reinstating a cluster ordering for directional data,
   `fromSite/ToSite` & `ProteinLinkPos*` column support, FASTA accession normalization, KEGG
   name-key fix (§8.2), thesis figures via Export PNG.
+
+---
+
+## 11. Code style (user request, 2026-10-05)
+
+- Every source file is split into **parts with plain-language headers** (no numbering), e.g.
+  `# ---- / # Building the matrix / # <one or two sentences on what this part does> / # ----`.
+  Comments and docstrings are written in a natural, non-terse voice. Keep this style when adding code;
+  put new code into the matching part.
+- **Two deliberate typos — do NOT fix them:** `n_skiped` (local in `print_matrix._build`) and
+  `postions` (local in `MatrixApp._pos_range`). The user asked for them.
+- Behaviour was verified unchanged after the restructure (18 CLI goldens identical; GUI harness 484
+  pygame + 308 numpy states identical; cutoff/sidebar checks pass). Line numbers elsewhere in this
+  report are outdated since — grep for function names.
+- Test-harness lesson: GUI tests that use `winfo_containing` or real input need
+  `app.attributes("-topmost", True)`, and runs can be disturbed by the user's own mouse while the
+  window is open (seen as a scrolled first dataset) — repeat a run before trusting a diff.

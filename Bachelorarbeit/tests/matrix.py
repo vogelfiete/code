@@ -1,3 +1,5 @@
+"""Smoke tests for the xlms package: reading crosslink CSVs (both decoy
+formats) and FASTA files. Run with: python tests/matrix.py"""
 import os
 import sys
 import tempfile
@@ -7,12 +9,33 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from xlms import CrossLink, CrossLinkDataset, load_dataset, read_csv, read_fasta
 
+
+# -----------------------------------------------------------------------------
+# Sample data
+#
+# A tiny CSV in each of the two decoy formats, one CSV that is missing the
+# decoy columns completely, and a FASTA file with the four proteins.
+# -----------------------------------------------------------------------------
+
 _SAMPLE_CSV = textwrap.dedent("""\
     Id,Protein1,Protein2,SeqPos1,SeqPos2,Score,isDecoy,isTT,isTD,isDD
     1,PROT_A,PROT_B,10,25,42.7,False,True,False,False
     2,PROT_A,DECOY_B,10,25,18.3,True,False,True,False
     3,DECOY_A,DECOY_B,5,12,9.1,True,False,False,True
     4,PROT_A,PROT_B,7,30,55.0,0,1,0,0
+""")
+
+_ALTERNATE_CSV = textwrap.dedent("""\
+    Id,Protein1,Protein2,SeqPos1,SeqPos2,Score,Decoy1,Decoy2,DecoyType
+    1,PROT_A,PROT_B,10,25,42.7,False,False,TT
+    2,PROT_A,DECOY_B,10,25,18.3,False,True,TD
+    3,DECOY_A,DECOY_B,5,12,9.1,True,True,DD
+    4,PROT_A,PROT_B,7,30,55.0,0,0,TT
+""")
+
+_BROKEN_CSV = textwrap.dedent("""\
+    Id,Protein1,Protein2,SeqPos1,SeqPos2,Score,SomeOtherCol
+    1,PROT_A,PROT_B,10,25,42.7,xyz
 """)
 
 _SAMPLE_FASTA = textwrap.dedent("""\
@@ -33,6 +56,13 @@ def _write_temp(content: str, suffix: str) -> str:
     f.close()
     return f.name
 
+
+# -----------------------------------------------------------------------------
+# Reading crosslinks
+#
+# The values should come out with the right Python types, and 0/1 should
+# work as well as True/False.
+# -----------------------------------------------------------------------------
 
 def test_read_csv_types():
     path = _write_temp(_SAMPLE_CSV, ".csv")
@@ -57,12 +87,54 @@ def test_read_csv_types():
     assert second.is_decoy is True
     assert second.is_td is True
 
-    # Row 4 uses 0/1 integers — verify they coerce to bool
+    # row 4 uses 0/1 instead of False/True
     fourth = links[3]
     assert fourth.is_decoy is False
     assert fourth.is_tt is True
     print("test_read_csv_types PASSED")
 
+
+def test_read_csv_alternate_format():
+    path = _write_temp(_ALTERNATE_CSV, ".csv")
+    links = read_csv(path)
+    os.unlink(path)
+
+    assert len(links) == 4
+    first = links[0]
+    assert first.is_decoy is False
+    assert first.is_tt is True
+    assert first.is_td is False
+    assert first.is_dd is False
+
+    second = links[1]
+    assert second.is_decoy is True   # Decoy2 is True
+    assert second.is_td is True
+
+    third = links[2]
+    assert third.is_decoy is True
+    assert third.is_dd is True
+
+    # row 4 uses 0/0 for Decoy1/Decoy2
+    fourth = links[3]
+    assert fourth.is_decoy is False
+    assert fourth.is_tt is True
+
+    # without any decoy columns the reader has to refuse the file
+    broken_path = _write_temp(_BROKEN_CSV, ".csv")
+    try:
+        read_csv(broken_path)
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+    finally:
+        os.unlink(broken_path)
+
+    print("test_read_csv_alternate_format PASSED")
+
+
+# -----------------------------------------------------------------------------
+# Reading sequences and whole datasets
+# -----------------------------------------------------------------------------
 
 def test_read_fasta_types():
     path = _write_temp(_SAMPLE_FASTA, ".fasta")
@@ -93,57 +165,9 @@ def test_load_dataset_filters():
     print("test_load_dataset_filters PASSED")
 
 
-_ALTERNATE_CSV = textwrap.dedent("""\
-    Id,Protein1,Protein2,SeqPos1,SeqPos2,Score,Decoy1,Decoy2,DecoyType
-    1,PROT_A,PROT_B,10,25,42.7,False,False,TT
-    2,PROT_A,DECOY_B,10,25,18.3,False,True,TD
-    3,DECOY_A,DECOY_B,5,12,9.1,True,True,DD
-    4,PROT_A,PROT_B,7,30,55.0,0,0,TT
-""")
-
-_BROKEN_CSV = textwrap.dedent("""\
-    Id,Protein1,Protein2,SeqPos1,SeqPos2,Score,SomeOtherCol
-    1,PROT_A,PROT_B,10,25,42.7,xyz
-""")
-
-
-def test_read_csv_alternate_format():
-    path = _write_temp(_ALTERNATE_CSV, ".csv")
-    links = read_csv(path)
-    os.unlink(path)
-
-    assert len(links) == 4
-    first = links[0]
-    assert first.is_decoy is False
-    assert first.is_tt is True
-    assert first.is_td is False
-    assert first.is_dd is False
-
-    second = links[1]
-    assert second.is_decoy is True   # Decoy2=True
-    assert second.is_td is True
-
-    third = links[2]
-    assert third.is_decoy is True
-    assert third.is_dd is True
-
-    # Row 4 uses 0/0 integers for Decoy1/Decoy2
-    fourth = links[3]
-    assert fourth.is_decoy is False
-    assert fourth.is_tt is True
-
-    # Missing required columns should raise
-    broken_path = _write_temp(_BROKEN_CSV, ".csv")
-    try:
-        read_csv(broken_path)
-        assert False, "Expected ValueError"
-    except ValueError:
-        pass
-    finally:
-        os.unlink(broken_path)
-
-    print("test_read_csv_alternate_format PASSED")
-
+# -----------------------------------------------------------------------------
+# Running the tests
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     test_read_csv_types()

@@ -1,8 +1,17 @@
+"""The data types the xlms package hands back: a single crosslink and a
+whole dataset of crosslinks plus protein sequences."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List
 
+
+# -----------------------------------------------------------------------------
+# One crosslink
+#
+# Two proteins, the linked position in each, the score and the target/decoy
+# classification of the link.
+# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
 class CrossLink:
@@ -17,6 +26,13 @@ class CrossLink:
     is_td: bool
     is_dd: bool
 
+
+# -----------------------------------------------------------------------------
+# A whole dataset
+#
+# All crosslinks of a file together with the protein sequences, plus a few
+# shortcuts to pick out the links you usually want.
+# -----------------------------------------------------------------------------
 
 @dataclass
 class CrossLinkDataset:

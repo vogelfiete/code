@@ -1,3 +1,5 @@
+"""Reading crosslink CSV files and FASTA sequence files into the types from
+xlms.models."""
 from __future__ import annotations
 
 import warnings
@@ -20,6 +22,14 @@ _CSV_DTYPE: dict = {
     "Score": float,
 }
 
+
+# -----------------------------------------------------------------------------
+# Reading crosslinks
+#
+# The CSV can say whether a link is target or decoy in one of two ways:
+# four flag columns (isDecoy/isTT/isTD/isDD), or one decoy flag per protein
+# plus a DecoyType column. Both end up as the same CrossLink objects.
+# -----------------------------------------------------------------------------
 
 def _normalise_bool(series: pd.Series) -> pd.Series:
     lowered = series.astype(str).str.strip().str.lower()
@@ -67,6 +77,13 @@ def read_csv(path: Union[str, Path]) -> List[CrossLink]:
     ]
 
 
+# -----------------------------------------------------------------------------
+# Reading sequences
+#
+# The FASTA header (up to the first space) becomes the protein name, the
+# sequence is stored in upper case.
+# -----------------------------------------------------------------------------
+
 def read_fasta(path: Union[str, Path]) -> Dict[str, str]:
     sequences: Dict[str, str] = {}
     with open(path, "r", encoding="utf-8-sig") as fh:
@@ -74,6 +91,13 @@ def read_fasta(path: Union[str, Path]) -> Dict[str, str]:
             sequences[record.id] = str(record.seq).upper()
     return sequences
 
+
+# -----------------------------------------------------------------------------
+# Loading both at once
+#
+# Also warns about proteins in the CSV that the FASTA file doesn't know,
+# which usually means the two files name proteins differently.
+# -----------------------------------------------------------------------------
 
 def load_dataset(
     csv_path: Union[str, Path],

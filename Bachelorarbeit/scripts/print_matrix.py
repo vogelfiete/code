@@ -1,10 +1,10 @@
-"""Print a sparse adjacency matrix for the top-N most-confident unique proteins
-(or residues) found in a crosslink CSV file. See docs/usage.md for the full CLI
-reference.
+"""Turn a crosslink CSV into a protein-protein (or residue-residue) matrix
+and print it to the console as a grid of dots.
 
-Pipeline:  CSV -> build_matrix / build_residue_matrix -> sort_proteins /
-sort_residues -> print_matrix.  The GUI (gui/matrix_app.py) reuses everything
-up to the rendering step."""
+The work happens in three steps: build the matrix from the CSV, put the axes
+into a useful order, then print it. The GUI (gui/matrix_app.py) reuses the
+first two steps and only draws the result differently.
+See docs/usage.md for the full command line reference."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ import tracemalloc
 import warnings
 from typing import NamedTuple
 
-# Ensure Unicode characters render correctly on Windows consoles
+# Windows consoles don't print the dot symbols correctly without this
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
 
@@ -26,30 +26,36 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from fetch_group_order import order_by_kegg, order_by_string, short_accession
 from xlms.io import read_fasta
 
+
+# -----------------------------------------------------------------------------
+# Settings
+#
+# How many items to show by default and how wide the console output is.
+# -----------------------------------------------------------------------------
+
 DEFAULT_N = 1000
 
-COL_W = 10   # column header width, in chars
-ROW_W = 12   # row label width, in chars
-CELL_W = 2   # one dot/dash plus a space
+COL_W = 10   # characters available for a column label (printed vertically)
+ROW_W = 12   # characters available for a row label
+CELL_W = 2   # one dot plus a space
 
 N_LEVELS = 4
-DOTS = ["·", "○", "●", "⬤"]   # small to large, keep in sync with N_LEVELS
+DOTS = ["·", "○", "●", "⬤"]   # from low to high score, one per level
 EMPTY = " "
 
 _DECOY_NAME_PREFIXES = ("decoy", "rev_", "contam_")
 
 
-# --------------------------------------------------------------------------
-# Axis items
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# What goes on the axes
+#
+# In protein mode every row/column is a protein name. In residue mode it is a
+# single residue of a protein. Both kinds can be compared and used as dict
+# keys, so the rest of the code doesn't need to care which one it gets.
+# -----------------------------------------------------------------------------
 
 class ResidueId(NamedTuple):
-    """One crosslinked residue: a protein plus a sequence position.
-
-    Hashable and orderable by (protein, pos), so it's a drop-in for the
-    protein-name strings used as the axis unit and sparse-dict key
-    everywhere in this module.
-    """
+    """One residue: the protein it belongs to and its position in the sequence."""
     protein: str
     pos: int
 
@@ -58,25 +64,29 @@ class ResidueId(NamedTuple):
 
 
 def protein_of(item) -> str:
-    """Parent protein of an axis item (a protein name or a ResidueId)."""
+    """The protein an axis item belongs to (works for both kinds of item)."""
     return item.protein if isinstance(item, ResidueId) else item
 
 
-# --------------------------------------------------------------------------
-# Small value parsers
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Reading single values from the CSV
+#
+# Search engines write positions and true/false flags in slightly different
+# ways. These helpers turn them into plain Python values, or None when a
+# value can't be used.
+# -----------------------------------------------------------------------------
 
 def _truncate(name: str, width: int) -> str:
     return name[:width]
 
 
 def _is_ambiguous(value) -> bool:
-    """Search tools report several candidates as e.g. "P1;P2" or "114;53"."""
+    """Some tools list several candidates in one cell, like "P1;P2" or "114;53"."""
     return ";" in str(value)
 
 
 def _parse_position(val) -> int | None:
-    """Residue position as int, or None if missing or ambiguous."""
+    """A residue position as a number, or None if it's missing or ambiguous."""
     if pd.isna(val) or _is_ambiguous(val):
         return None
     try:
@@ -86,7 +96,8 @@ def _parse_position(val) -> int | None:
 
 
 def _combine_pep_link(pep_val, link_val) -> int | None:
-    """Absolute position = peptide start + 1-based link offset - 1."""
+    """Position in the protein from where the peptide starts plus where the
+    link sits inside the peptide (counted from 1)."""
     pep = _parse_position(pep_val)
     link = _parse_position(link_val)
     if pep is None or link is None:
@@ -104,13 +115,16 @@ def _is_decoy_by_name(name: str) -> bool:
     return name.lower().startswith(_DECOY_NAME_PREFIXES)
 
 
-# --------------------------------------------------------------------------
-# Column detection (all names are matched case-insensitively)
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Finding the right columns
+#
+# Column names are matched without caring about upper or lower case, and a
+# few common spellings are accepted for the position columns.
+# -----------------------------------------------------------------------------
 
 def _detect_decoy_cols(lower: dict[str, str]) -> dict[str, str]:
-    """Format "B" = Decoy1/Decoy2 (per protein), format "A" = isTT/isDD
-    (per link), or "none"."""
+    """Which decoy columns the file has: format "B" marks each protein with
+    Decoy1/Decoy2, format "A" marks each link with isTT/isDD."""
     if "decoy1" in lower and "decoy2" in lower:
         return {"format": "B", "d1": lower["decoy1"], "d2": lower["decoy2"]}
     if "istt" in lower and "isdd" in lower:
@@ -119,9 +133,10 @@ def _detect_decoy_cols(lower: dict[str, str]) -> dict[str, str]:
 
 
 def _detect_position_cols(lower: dict[str, str]) -> dict[str, str] | None:
-    """Format "direct": the column holds the absolute residue position
-    (SeqPos1/2, Pos1/2 or Position1/2). Format "pep_link": PepPos1/2 (peptide
-    start) plus LinkPos1/2 (1-based offset in the peptide). None if absent."""
+    """Where the residue positions are. Either the file already has the
+    position in the protein ("direct": SeqPos, Pos or Position), or it has the
+    peptide start plus the link offset in the peptide ("pep_link").
+    Returns None if neither is there."""
     for a, b in (("seqpos1", "seqpos2"), ("pos1", "pos2"), ("position1", "position2")):
         if a in lower and b in lower:
             return {"format": "direct", "pos1": lower[a], "pos2": lower[b]}
@@ -135,7 +150,7 @@ def _detect_position_cols(lower: dict[str, str]) -> dict[str, str] | None:
 
 
 def _positions(df: pd.DataFrame, pos_info: dict[str, str]) -> tuple[list, list]:
-    """Per-row absolute residue positions (int or None) for both link ends."""
+    """The residue position of both link ends for every row (None if unusable)."""
     if pos_info["format"] == "direct":
         return ([_parse_position(v) for v in df[pos_info["pos1"]]],
                 [_parse_position(v) for v in df[pos_info["pos2"]]])
@@ -143,9 +158,12 @@ def _positions(df: pd.DataFrame, pos_info: dict[str, str]) -> tuple[list, list]:
             [_combine_pep_link(p, l) for p, l in zip(df[pos_info["pep2"]], df[pos_info["link2"]])])
 
 
-# --------------------------------------------------------------------------
-# Decoy classification
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Telling targets from decoys
+#
+# Decoys are drawn in their own block after the targets, so every protein
+# needs a target/decoy label.
+# -----------------------------------------------------------------------------
 
 def _classify_proteins(
     df: pd.DataFrame,
@@ -154,13 +172,13 @@ def _classify_proteins(
     decoy_info: dict[str, str],
     proteins: set[str],
 ) -> dict[str, bool]:
-    """Return {protein: is_decoy} for every protein in `proteins`.
-    Rows are applied in order, so for conflicting rows the last one wins."""
+    """Decide for each protein whether it is a decoy. The rows are read in
+    order, so if two rows disagree the later one wins."""
     result: dict[str, bool] = {}
     fmt = decoy_info["format"]
 
     if fmt == "B":
-        # each end of a link carries its own decoy flag
+        # every end of a link has its own decoy flag
         for p1, p2, d1, d2 in zip(names1, names2, df[decoy_info["d1"]], df[decoy_info["d2"]]):
             if p1 in proteins:
                 result[p1] = _to_bool(d1)
@@ -168,47 +186,52 @@ def _classify_proteins(
                 result[p2] = _to_bool(d2)
 
     elif fmt == "A":
-        # TT links make both ends targets, DD links make both ends decoys
+        # a TT link means both proteins are targets, a DD link means both are decoys
         for p1, p2, tt, dd in zip(names1, names2, df[decoy_info["istt"]], df[decoy_info["isdd"]]):
             if _to_bool(tt):
                 label = False
             elif _to_bool(dd):
                 label = True
             else:
-                continue  # TD links say nothing about which end is the decoy
+                continue  # a TD link doesn't say which end is the decoy
             for p in (p1, p2):
                 if p in proteins:
                     result[p] = label
-        # proteins only seen in TD links: guess from the name
+        # proteins we only saw in TD links: guess from the name
         for p in proteins - result.keys():
             result[p] = _is_decoy_by_name(p)
 
-    # unclassified proteins (or fmt == "none") default to target
+    # anything still unknown counts as a target
     for p in proteins:
         result.setdefault(p, False)
     return result
 
 
-# --------------------------------------------------------------------------
-# Matrix construction
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Building the matrix
+#
+# We go through the CSV from the best score to the worst and collect proteins
+# (or residues) until we have N of them. Then we go through it once more and
+# keep the best score for every pair among those items.
+#
+# The matrix has a direction: a row "A,B" lands in row A, column B, and a row
+# "B,A" lands in row B, column A. The two are never merged.
+# -----------------------------------------------------------------------------
 
 def build_matrix(path: str, n: int = DEFAULT_N):
-    """Protein level. Returns (proteins, sparse, is_decoy):
-        proteins — N unique protein names, targets first then decoys,
-                   confidence order preserved within each group
-        sparse   — {(protein1, protein2): best_score}, directional: the
-                   key is (Protein1, Protein2) exactly as in the CSV row,
-                   so A-B and B-A are separate entries (row A/col B vs
-                   row B/col A)
-        is_decoy — {protein: bool}
+    """Build the protein-level matrix. Returns (proteins, sparse, is_decoy):
+        proteins — N protein names, targets first, then decoys, each group in
+                   order of confidence
+        sparse   — {(protein1, protein2): best score}, with the pair in the
+                   same order as in the CSV row
+        is_decoy — {protein: True/False}
     """
     return _build(path, n, level="protein")
 
 
 def build_residue_matrix(path: str, n: int = DEFAULT_N):
-    """Residue level — same as build_matrix, but the axis unit is a
-    ResidueId(protein, position). Needs residue-position columns."""
+    """Same as build_matrix, but every row and column is a single residue.
+    The CSV needs residue position columns for this."""
     return _build(path, n, level="residue")
 
 
@@ -232,7 +255,7 @@ def _build(path: str, n: int, level: str):
     names2 = [str(v) for v in df[lower["protein2"]]]
     scores = [float(v) for v in df[lower["score"]]]
 
-    # the two axis items of every row; None where a residue position is unusable
+    # what ends up on the axes for each row; None if a residue position is unusable
     if pos_info is None:
         items1, items2 = names1, names2
     else:
@@ -240,21 +263,21 @@ def _build(path: str, n: int, level: str):
         items1 = [ResidueId(p, x) if x is not None else None for p, x in zip(names1, pos1)]
         items2 = [ResidueId(p, x) if x is not None else None for p, x in zip(names2, pos2)]
 
-    # pass 1: walk rows highest-score-first until we have N unique items
+    # Pick the N most confident items, best score first
     selected: dict = {}
-    n_skipped = 0
+    n_skiped = 0
     for name1, name2, a, b in zip(names1, names2, items1, items2):
         if _is_ambiguous(name1) or _is_ambiguous(name2):
             continue
         if a is None or b is None:
-            n_skipped += 1
+            n_skiped += 1
             continue
         selected.setdefault(a)
         selected.setdefault(b)
         if len(selected) >= n:
             break
-    if n_skipped:
-        warnings.warn(f"{n_skipped} row(s) skipped: missing/ambiguous residue position")
+    if n_skiped:
+        warnings.warn(f"{n_skiped} row(s) skipped: missing/ambiguous residue position")
     if not selected:
         raise ValueError("No usable crosslinks were found in the CSV.")
 
@@ -262,10 +285,10 @@ def _build(path: str, n: int, level: str):
         df, names1, names2, decoy_info, {protein_of(x) for x in selected}
     )
     is_decoy = {x: protein_is_decoy[protein_of(x)] for x in selected}
-    # targets first, then decoys; sorted() is stable, so confidence order is kept
+    # targets before decoys; sorted() keeps the confidence order inside each group
     items = sorted(selected, key=lambda x: is_decoy[x])
 
-    # pass 2: best score per directed item pair (row = Protein1, col = Protein2)
+    # Remember the best score for every pair, in the direction the CSV gives it
     wanted = set(items)
     sparse: dict[tuple, float] = {}
     for a, b, score in zip(items1, items2, scores):
@@ -275,14 +298,21 @@ def _build(path: str, n: int, level: str):
     return items, sparse, is_decoy
 
 
+# -----------------------------------------------------------------------------
+# Showing residues that have no crosslinks
+#
+# Optional for residue mode: fill in all the other positions of each protein,
+# so you can see where the linked residues sit in the whole sequence.
+# -----------------------------------------------------------------------------
+
 def add_unlinked_residues(
     residues: list[ResidueId],
     residue_is_decoy: dict[ResidueId, bool],
     sequences: dict[str, str],
 ) -> tuple[list[ResidueId], dict[ResidueId, bool]]:
-    """Also include every other residue position of each protein already
-    present (needs the full sequence). The added residues have no score
-    entries, so they render as empty cells."""
+    """Add every other position of each protein that is already in the list.
+    This needs the protein sequences. The new residues have no scores, so
+    they show up as empty cells."""
     proteins = list(dict.fromkeys(r.protein for r in residues))
     protein_is_decoy = {r.protein: residue_is_decoy[r] for r in residues}
 
@@ -306,18 +336,21 @@ def add_unlinked_residues(
     return expanded, is_decoy
 
 
-# --------------------------------------------------------------------------
-# Axis ordering
-# --------------------------------------------------------------------------
-# Each ordering takes (group, sequences, species) and returns
-# (reordered group, {item: section_label} or None).
+# -----------------------------------------------------------------------------
+# Putting the axes in a useful order
+#
+# Every ordering gets a group of proteins and returns them reordered, plus
+# optional section names (used for the pathway and complex groupings).
+# Targets and decoys are always ordered separately.
+# -----------------------------------------------------------------------------
 
 def _order_alpha(group, sequences, species):
     return sorted(group), None
 
 
 def _order_sequence(group, sequences, species):
-    """Cluster by 3-mer composition (crude but fast proxy for sequence similarity)."""
+    """Put proteins with similar sequences next to each other. Similarity is
+    estimated from how often each 3-letter piece occurs, which is rough but fast."""
     import numpy as np
     from scipy.cluster.hierarchy import leaves_list, linkage
     from scipy.spatial.distance import cdist, squareform
@@ -353,7 +386,7 @@ def _order_sequence(group, sequences, species):
 
 
 def _order_size(group, sequences, species):
-    """Longest sequence first; proteins without a sequence go last."""
+    """Longest protein first; proteins without a known sequence go last."""
     def key(p: str) -> int:
         return -len(sequences[p]) if sequences and p in sequences else 1
     return sorted(group, key=key), None
@@ -374,7 +407,7 @@ _ORDERINGS = {
     "complex": _order_complex,
     "size": _order_size,
 }
-ORDER_MODES = ["confidence", *_ORDERINGS]   # "confidence" = keep the input order
+ORDER_MODES = ["confidence", *_ORDERINGS]   # "confidence" just keeps the order we already have
 
 
 def _apply_order(group, mode, sequences, species=9606):
@@ -391,7 +424,7 @@ def sort_proteins(
     sequences: dict[str, str] | None = None,
     species: int = 9606,
 ) -> tuple[list[str], dict[str, str] | None]:
-    """Reorder proteins by `mode`, keeping targets before decoys."""
+    """Reorder the proteins with the chosen mode, targets still before decoys."""
     targets = [p for p in proteins if not protein_is_decoy.get(p, False)]
     decoys = [p for p in proteins if protein_is_decoy.get(p, False)]
     t_ordered, t_sections = _apply_order(targets, mode, sequences, species)
@@ -407,9 +440,9 @@ def sort_residues(
     sequences: dict[str, str] | None = None,
     species: int = 9606,
 ) -> tuple[list[ResidueId], dict[ResidueId, str]]:
-    """Order the parent proteins with sort_proteins, then list each protein's
-    residues by position. The parent protein is always the section label."""
-    # first-occurrence order keeps mode="confidence" meaningful
+    """Order the proteins the residues belong to, then list each protein's
+    residues by position. Each residue's section is its protein."""
+    # keep the order in which proteins first appear, so "confidence" still means something
     proteins = list(dict.fromkeys(r.protein for r in residues))
     protein_is_decoy = {r.protein: residue_is_decoy[r] for r in residues}
 
@@ -422,12 +455,15 @@ def sort_residues(
     return ordered, {r: r.protein for r in ordered}
 
 
-# --------------------------------------------------------------------------
-# Console rendering
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Printing the matrix to the console
+#
+# Scores become dots of four sizes. Column labels are written top to bottom,
+# one character per line, and a | / + line separates targets from decoys.
+# -----------------------------------------------------------------------------
 
 def _build_thresholds(sparse: dict[tuple, float]) -> list[float]:
-    """Upper bounds of the first N_LEVELS-1 dot sizes (equal-width bins)."""
+    """Where one dot size ends and the next begins (equal steps up to the best score)."""
     max_score = max(sparse.values())
     return [max_score * (i + 1) / N_LEVELS for i in range(N_LEVELS - 1)]
 
@@ -440,7 +476,7 @@ def _score_to_dot(score: float, thresholds: list[float]) -> str:
 
 
 def _col_separator_line(n: int, split: int) -> str:
-    """Horizontal rule with a '+' at the target/decoy boundary."""
+    """The horizontal rule, with a '+' where the decoys start."""
     dashes = "-" * CELL_W
     if 0 < split < n:
         return dashes * split + "-+" + dashes * (n - split)
@@ -448,7 +484,7 @@ def _col_separator_line(n: int, split: int) -> str:
 
 
 def _section_header_line(items: list, sections: dict, split: int, row_prefix: str) -> str:
-    """`=label=` spans over each run of items that share a section."""
+    """One line with a `=name=` banner above each run of items in the same section."""
     n = len(items)
     has_sep = 0 < split < n
     line = row_prefix
@@ -476,9 +512,9 @@ def print_matrix(
     row_label_fn=None,
     legend_source: str = "col",
 ) -> None:
-    """Render the dot matrix to stdout. `items` are protein names or
-    ResidueIds. legend_source ("col" or "row") picks which label set the
-    truncated-name legend is built from."""
+    """Print the dot matrix. `items` are protein names or residues.
+    legend_source ("col" or "row") says which labels the name legend at the
+    bottom explains."""
     col_label_fn = col_label_fn or (lambda p: _truncate(p, COL_W))
     row_label_fn = row_label_fn or (lambda p: _truncate(p, ROW_W))
 
@@ -493,7 +529,7 @@ def print_matrix(
     if sections:
         print(_section_header_line(items, sections, split, row_prefix))
 
-    # column labels are printed vertically, one character row at a time
+    # column labels, one character per printed line
     for char_idx in range(max(len(lb) for lb in col_labels)):
         line = row_prefix
         for i, lb in enumerate(col_labels):
@@ -545,9 +581,12 @@ def _sparse_size_bytes(sparse: dict[tuple, float]) -> int:
     return total
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Command line
+#
+# Reads the options, builds and orders the matrix, prints it, and finishes
+# with a short summary (number of targets/decoys and memory use).
+# -----------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print XL-MS adjacency matrix")
