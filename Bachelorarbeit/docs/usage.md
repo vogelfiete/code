@@ -165,9 +165,12 @@ options as the CLI, plus **Load**, **Export PNG…** and the load status.
 
 - **Colormap** — `(none)` for greyscale, or a matplotlib colormap (e.g.
   `coolwarm`) if matplotlib is installed.
-- **Norm** — linear or quantile score normalization for the colormap.
+  With a colormap, the colour follows the rank of a score among all scores
+  (quantile), so the colours are spread evenly even when most scores lie
+  close together.
 - **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
-  score. Zooming below 4 px merges neighbouring items into blocks.
+  score. Zooming below 4 px merges neighbouring items into blocks. The
+  slider zooms around the middle of the view.
 - **Aggregate** — how a block's scores are combined: mean, geometric mean
   or max.
 
@@ -179,6 +182,11 @@ score has the same colour whatever the cutoff. The label shows the range and
 how many links are visible; **Reset** restores the full range. Loading new
 data resets the cutoff.
 
+**Moving around** — the matrix works like a map. Turn the mouse wheel over
+it to zoom in and out; the spot under the pointer stays where it is. Hold
+the left mouse button and drag to move the matrix (the column headers and
+row labels move along). The scrollbars and the arrow keys scroll as well.
+
 **Selection** — click a cell to see both proteins' names, decoy status,
 section (if pathway/complex ordering is active), and the crosslink scores in
 both directions: `row→col` (the clicked cell) and `col→row` (its mirror
@@ -186,6 +194,8 @@ cell) — in residue mode, also the residue position. A cell hidden by the
 cutoff shows its score marked `(hidden by cutoff)`. When zoomed out into
 blocks, the aggregated score of each direction is shown. Clicking also
 triggers a background UniProt lookup for the full protein name and length.
+A click only counts if the mouse wasn't dragged in between, and the
+selection stays on the same proteins when you zoom.
 
 If `pygame` is installed, the matrix canvas renders through an embedded SDL2
 surface for smoother scrolling on large matrices; otherwise it falls back to

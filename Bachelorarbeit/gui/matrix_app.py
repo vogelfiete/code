@@ -58,7 +58,8 @@ from xlms.io import read_fasta  # type: ignore[import]
 # -----------------------------------------------------------------------------
 # Settings
 #
-# Cell sizes, how zooming out into blocks behaves, fonts and colours.
+# Cell sizes, how zooming out into blocks behaves, the mouse, fonts and
+# colours.
 # -----------------------------------------------------------------------------
 
 CELL_PX_MIN = 4
@@ -71,6 +72,9 @@ BLOCK_ZOOM_GROWTH = 1.3   # each step makes blocks this much bigger (feels like 
 BLOCK_SIZE_MAX = 500      # never merge more items than this into one block
 _AGG_METHODS = {"Mean": "mean", "Geometric Mean": "geomean", "Max Score": "max"}   # dropdown -> key
 _AGG_NAMES = {"mean": "Mean", "geomean": "Geometric mean", "max": "Max"}          # key -> info text
+
+DRAG_THRESHOLD_PX = 4     # moving the mouse further than this with the button down is a drag, not a click
+WHEEL_ZOOM_STEP = 0.15    # one notch of the mouse wheel changes the cell size by about this share
 
 LABEL_FONT_SIZE = 9
 SIDEBAR_W = 270           # width of the control panel on the left, in pixels
@@ -109,21 +113,14 @@ def _make_lut(cmap_name: str) -> np.ndarray:
     return (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
 
 
-def _score_to_bg(
-    score: float,
-    min_s: float,
-    max_s: float,
-    lut: np.ndarray,
-    score_sorted: np.ndarray | None = None,
-) -> tuple[int, int, int]:
-    """The colormap colour for a score. With score_sorted the colour follows
-    the score's rank (quantile), otherwise it scales linearly from min to max."""
-    if score_sorted is not None and len(score_sorted) > 0:
+def _score_to_bg(score: float, lut: np.ndarray, score_sorted: np.ndarray) -> tuple[int, int, int]:
+    """The colormap colour for a score. The colour follows the score's rank
+    among all scores (quantile): the lowest score gets the first colour of
+    the colormap, the median the middle one, the highest the last."""
+    if len(score_sorted) > 0:
         idx = int(np.searchsorted(score_sorted, score) / len(score_sorted) * 255)
-    elif max_s <= min_s:
-        idx = 128
     else:
-        idx = int((score - min_s) / (max_s - min_s) * 255)
+        idx = 128
     r, g, b = lut[max(0, min(255, idx))]
     return int(r), int(g), int(b)
 
@@ -145,6 +142,16 @@ def _aggregate(values: list[float], method: str) -> float:
         # normal mean, because dropping the block would make real crosslinks
         # look like empty cells.
     return sum(values) / len(values)
+
+
+def _aggregate_groups(scores: list[float], starts: list[int], method: str) -> list[float]:
+    """_aggregate for many groups at once. Group k is scores[starts[k]:starts[k+1]]."""
+    pairs = zip(starts, starts[1:])
+    if method == "mean":
+        # written out here, because this runs for every cell on every zoom
+        # step and calling _aggregate each time is too slow
+        return [scores[a] if b - a == 1 else sum(scores[a:b]) / (b - a) for a, b in pairs]
+    return [_aggregate(scores[a:b], method) for a, b in pairs]
 
 
 # -----------------------------------------------------------------------------
@@ -268,6 +275,11 @@ class MatrixApp(tk.Tk):
         self._col_labels: list[str] = []
         self._row_labels: list[str] = []
         self._item_index: dict = {}
+        # Every crosslink once more as arrays (row item, column item, score),
+        # in the same order as self._sparse. numpy is much faster on these.
+        self._link_rows: np.ndarray = np.zeros(0, dtype=np.int64)
+        self._link_cols: np.ndarray = np.zeros(0, dtype=np.int64)
+        self._link_scores: np.ndarray = np.zeros(0)
 
         # Blocks. All drawing code works on blocks instead of single items.
         # Without zooming out every block holds exactly one item.
@@ -277,14 +289,20 @@ class MatrixApp(tk.Tk):
         self._item_to_block: list[int] = []
         self._split_block: int = 0
         self._agg_method: str = "mean"
-        self._block_pair_raw: dict[tuple[int, int], list[float]] = {}
-        self._block_scores: dict[tuple[int, int], float] = {}
-        self._block_pair_n: dict[tuple[int, int], int] = {}
+        # The crosslinks sorted into cells: _group_scores holds the scores cell
+        # by cell, and cell k owns the part _group_starts[k]:_group_starts[k+1].
+        self._group_scores: list[float] = []
+        self._group_starts: list[int] = [0]
+
+        # Every cell that has a value, row by row, ready for drawing
+        self._cell_rows: np.ndarray = np.zeros(0, dtype=np.int64)    # row block
+        self._cell_cols: np.ndarray = np.zeros(0, dtype=np.int64)    # column block
+        self._cell_scores: np.ndarray = np.zeros(0)
+        self._cell_rgb: np.ndarray = np.zeros((0, 3), dtype=np.uint8)
 
         # Colours
         self._cmap_name: str = "coolwarm"
         self._cmap_lut: np.ndarray | None = None   # None means greyscale
-        self._norm_mode: str = "linear"
         self._min_score: float = 0.0
         self._max_score: float = 1.0
         self._score_sorted: np.ndarray = np.array([])
@@ -296,8 +314,15 @@ class MatrixApp(tk.Tk):
         # Redrawing and the current selection
         self._pending: bool = False
         self._selected: tuple[int, int] | None = None   # (row block, column block)
+        self._selected_items: tuple[int, int] | None = None   # the clicked row and column item, to find the cell again after zooming
         self._sel_token: int = 0                        # so an old UniProt answer can't overwrite a newer click
         self._uniprot_cache: dict[str, tuple[str, int]] = {}
+
+        # Mouse: where a press started (mouse x, y and scroll offset x, y) and
+        # whether it has turned into a drag
+        self._drag_start: tuple[int, int, float, float] | None = None
+        self._dragging: bool = False
+        self._zoom_value: int = CELL_PX_DEFAULT    # the zoom slider value that is shown right now
 
         # Fonts: the Tk font is only used for measuring, the PIL fonts for drawing
         self._lf: tkfont.Font | None = None
@@ -310,8 +335,12 @@ class MatrixApp(tk.Tk):
         self._mx_photo: ImageTk.PhotoImage | None = None
         self._ch_photo: ImageTk.PhotoImage | None = None
         self._rl_photo: ImageTk.PhotoImage | None = None
+        # Writing text is slow, so every name and every score is only written once
+        self._label_cache: dict[tuple[str, bool], Image.Image] = {}
+        self._text_cache: dict[str, tuple[Image.Image, int, int]] = {}
 
         # pygame renderer (only used if pygame is installed)
+        self._pg_host: tk.Frame | None = None       # the window pygame draws into
         self._pg_screen = None
         self._pg_size: tuple[int, int] = (0, 0)
         self._pg_font = None
@@ -410,15 +439,9 @@ class MatrixApp(tk.Tk):
             values=["(none)", "coolwarm"] if _MPL else ["(none)"],
         ))
         self._cmap_var.trace_add("write", lambda *_: self._on_colormap_change())
-        self._norm_var = tk.StringVar(value="linear")
-        norm = tk.Frame(display)
-        for label, value in [("Linear", "linear"), ("Quantile", "quantile")]:
-            tk.Radiobutton(norm, text=label, variable=self._norm_var, value=value,
-                           command=self._on_norm_change).pack(side=tk.LEFT)
-        field(display, 1, "Norm", norm)
         if not _MPL:
             tk.Label(display, text="(matplotlib not available)", fg="red").grid(
-                row=2, column=0, columnspan=3, sticky="w")
+                row=1, column=0, columnspan=3, sticky="w")
 
         self._zoom_label_var = tk.StringVar(value=f"{CELL_PX_DEFAULT}px")
         self._zoom = tk.Scale(
@@ -426,11 +449,11 @@ class MatrixApp(tk.Tk):
             orient=tk.HORIZONTAL, showvalue=False, command=self._on_zoom,
         )
         self._zoom.set(CELL_PX_DEFAULT)
-        field(display, 3, "Zoom", self._zoom)
+        field(display, 2, "Zoom", self._zoom)
         tk.Label(display, textvariable=self._zoom_label_var, fg="gray").grid(
-            row=4, column=1, columnspan=2, sticky="w", padx=(4, 0))
+            row=3, column=1, columnspan=2, sticky="w", padx=(4, 0))
         self._agg_method_var = tk.StringVar(value="Mean")
-        field(display, 5, "Aggregate", ttk.Combobox(
+        field(display, 4, "Aggregate", ttk.Combobox(
             display, textvariable=self._agg_method_var, width=10, state="readonly",
             values=list(_AGG_METHODS),
         ))
@@ -539,7 +562,9 @@ class MatrixApp(tk.Tk):
         self._mx.bind("<MouseWheel>", self._wheel)
         self._mx.bind("<Button-4>", self._wheel)
         self._mx.bind("<Button-5>", self._wheel)
-        self._mx.bind("<Button-1>", self._on_click)
+        self._mx.bind("<ButtonPress-1>", lambda e: self._press(e.x, e.y))
+        self._mx.bind("<B1-Motion>", lambda e: self._drag_to(e.x, e.y))
+        self._mx.bind("<ButtonRelease-1>", lambda e: self._release(e.x, e.y))
         self._mx.bind("<Up>",    lambda e: self._scroll(0, -1))
         self._mx.bind("<Down>",  lambda e: self._scroll(0,  1))
         self._mx.bind("<Left>",  lambda e: self._scroll(-1, 0))
@@ -556,6 +581,7 @@ class MatrixApp(tk.Tk):
 
     def _update_cell_font(self) -> None:
         self._pil_cf = _find_pil_font(max(6, self._cell_px - 2))
+        self._text_cache.clear()
         if self._pg_screen is not None:
             self._pg_font = _pygame.font.Font(None, max(8, self._cell_px - 2))
             self._pg_cache.clear()
@@ -577,15 +603,22 @@ class MatrixApp(tk.Tk):
     # -------------------------------------------------------------------------
     # The pygame renderer
     #
-    # pygame draws into a window that is placed inside the matrix canvas. A
-    # new picture is only drawn when something changes. A short loop puts the
-    # finished picture back on screen, because Tk sometimes paints over it,
-    # and picks up mouse clicks.
+    # pygame draws into its own window, which lies on top of the matrix
+    # canvas and covers it completely. A new picture is only drawn when
+    # something changes. A short loop puts the finished picture back on
+    # screen and picks up what the mouse does.
     # -------------------------------------------------------------------------
 
     def _init_pygame(self) -> None:
+        # A frame without a background is a window that Tk never paints into.
+        # Drawing straight into the canvas doesn't work well: Tk repaints the
+        # canvas after every scroll step, and the picture flashes white.
+        self._pg_host = tk.Frame(self._mx, bg="")
+        self._pg_host.place(x=0, y=0, relwidth=1, relheight=1)
+        for wheel in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self._pg_host.bind(wheel, self._wheel)
         self.update_idletasks()
-        os.environ["SDL_WINDOWID"] = str(self._mx.winfo_id())
+        os.environ["SDL_WINDOWID"] = str(self._pg_host.winfo_id())
         _pygame.display.quit()
         _pygame.display.init()
         _pygame.font.init()
@@ -594,9 +627,13 @@ class MatrixApp(tk.Tk):
         self._pg_loop()
 
     def _pg_sync_size(self) -> bool:
-        """Make the pygame window and the off-screen picture as big as the
-        canvas. Returns True if the size changed (the picture is then blank)."""
-        size = (max(1, self._mx.winfo_width()), max(1, self._mx.winfo_height()))
+        """Make the pygame display and the off-screen picture as big as the
+        window pygame draws into. Returns True if the size changed (the
+        picture is then blank)."""
+        # Ask the pygame window itself, not the canvas: after a resize the
+        # canvas has its new size a moment earlier, and pygame would then
+        # still pick up the old size of its window.
+        size = (max(1, self._pg_host.winfo_width()), max(1, self._pg_host.winfo_height()))
         if size == self._pg_size:
             return False
         self._pg_screen = _pygame.display.set_mode(size, 0, 32)
@@ -606,8 +643,8 @@ class MatrixApp(tk.Tk):
         return True
 
     def _pg_loop(self) -> None:
-        """Runs about every 16 ms. It only handles clicks and shows the last
-        picture again; drawing a new one is _redraw's job."""
+        """Runs about every 16 ms. It only handles the mouse and shows the
+        last picture again; drawing a new one is _redraw's job."""
         try:
             self._poll_pygame_events()
             self._present()
@@ -616,10 +653,18 @@ class MatrixApp(tk.Tk):
         self.after(16, self._pg_loop)
 
     def _poll_pygame_events(self) -> None:
-        # inside the pygame window, mouse clicks go to pygame instead of Tk
+        # inside the pygame window, the mouse buttons go to pygame instead of Tk
         for ev in _pygame.event.get():
             if ev.type == _pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                self.after(0, lambda p=ev.pos: self._select_at(*p))
+                self._press(*ev.pos)
+            elif ev.type == _pygame.MOUSEMOTION:
+                if ev.buttons[0]:
+                    self._drag_to(*ev.pos)
+                else:
+                    # the button was let go somewhere we couldn't see it
+                    self._release(*ev.pos)
+            elif ev.type == _pygame.MOUSEBUTTONUP and ev.button == 1:
+                self._release(*ev.pos)
 
     def _present(self) -> None:
         """Copy the finished picture into the pygame window (takes about 0.4 ms)."""
@@ -660,9 +705,6 @@ class MatrixApp(tk.Tk):
         self._ch_canvas.xview(*args)
         self._schedule()
 
-    def _wheel(self, event: tk.Event) -> None:
-        self._scroll(0, 3 if (event.num == 5 or event.delta < 0) else -3)
-
     def _scroll(self, dx: int, dy: int) -> None:
         if dy:
             self._mx.yview_scroll(dy, "units")
@@ -670,6 +712,17 @@ class MatrixApp(tk.Tk):
         if dx:
             self._mx.xview_scroll(dx, "units")
             self._ch_canvas.xview_scroll(dx, "units")
+        self._schedule()
+
+    def _scroll_to(self, ox: float, oy: float) -> None:
+        """Move the view so that pixel (ox, oy) of the whole matrix sits in
+        the top-left corner. Tk keeps the view inside the matrix by itself."""
+        size = len(self._blocks) * self._cell_px
+        if size:
+            self._mx.xview_moveto(ox / size)
+            self._ch_canvas.xview_moveto(ox / size)
+            self._mx.yview_moveto(oy / size)
+            self._rl_canvas.yview_moveto(oy / size)
         self._schedule()
 
     def _visible_blocks(self) -> tuple[range, range]:
@@ -685,6 +738,66 @@ class MatrixApp(tk.Tk):
         if not self._pending:
             self._pending = True
             self.after(0, self._redraw)
+
+    # -------------------------------------------------------------------------
+    # Moving around with the mouse
+    #
+    # Like on a map: the wheel zooms in and out around the mouse pointer, and
+    # holding the left button down drags the matrix. A press that is let go
+    # without moving is a normal click and selects the cell.
+    # -------------------------------------------------------------------------
+
+    def _wheel(self, event: tk.Event) -> None:
+        v = self._zoom_value
+        # Above the smallest cell size a notch changes the size by a share of
+        # itself, so it feels the same at every size. Below it, each slider
+        # step already merges 1.3 times as many items.
+        step = max(1, round(v * WHEEL_ZOOM_STEP))
+        if event.num == 5 or event.delta < 0:   # zoom out
+            v = v - 1 if v <= CELL_PX_MIN else max(CELL_PX_MIN, v - step)
+        else:
+            v = v + 1 if v < CELL_PX_MIN else v + step
+        v = min(max(v, CELL_PX_MIN - BLOCK_ZOOM_STEPS), CELL_PX_MAX)
+        # ask Tk where the pointer is; that also works above the pygame window
+        anchor = (self.winfo_pointerx() - self._mx.winfo_rootx(),
+                  self.winfo_pointery() - self._mx.winfo_rooty())
+        self._on_zoom(str(v), anchor)
+        self._zoom.set(v)
+
+    def _press(self, x: int, y: int) -> None:
+        self._mx.focus_set()   # so the arrow keys work again after typing in the control panel
+        self._drag_start = (x, y, self._mx.canvasx(0), self._mx.canvasy(0))
+        self._dragging = False
+
+    def _drag_to(self, x: int, y: int) -> None:
+        if self._drag_start is None:
+            return
+        x0, y0, ox, oy = self._drag_start
+        if not self._dragging and max(abs(x - x0), abs(y - y0)) > DRAG_THRESHOLD_PX:
+            self._dragging = True
+            self._show_drag_cursor(True)
+        if self._dragging:
+            self._scroll_to(ox - (x - x0), oy - (y - y0))
+
+    def _release(self, x: int, y: int) -> None:
+        if self._drag_start is None:
+            return
+        if self._dragging:
+            self._show_drag_cursor(False)
+        else:
+            self._select_at(x, y)
+        self._drag_start = None
+        self._dragging = False
+
+    def _show_drag_cursor(self, dragging: bool) -> None:
+        """Show the four-arrow cursor while the matrix is being dragged."""
+        if self._pg_screen is not None:
+            # Changing the cursor of the Tk canvas would make Tk paint the
+            # canvas again, right over the pygame picture, which shows as a
+            # flash. So the pygame window gets the cursor instead.
+            _pygame.mouse.set_cursor(_pygame.SYSTEM_CURSOR_SIZEALL if dragging else _pygame.SYSTEM_CURSOR_ARROW)
+        else:
+            self._mx.configure(cursor="fleur" if dragging else "")
 
     # -------------------------------------------------------------------------
     # Loading data
@@ -756,6 +869,12 @@ class MatrixApp(tk.Tk):
         self._max_score = max(scores) if scores else 1.0
         self._score_sorted = np.sort(scores) if scores else np.array([])
         self._item_index = {p: i for i, p in enumerate(items)}
+        index = self._item_index
+        self._link_rows = np.array([index[a] for a, _ in sparse], dtype=np.int64)
+        self._link_cols = np.array([index[b] for _, b in sparse], dtype=np.int64)
+        self._link_scores = np.array(scores, dtype=float)
+        self._label_cache.clear()
+        self._clear_selection()   # it pointed into the old data
         self._cut_lo, self._cut_hi = self._min_score, self._max_score
         self._cutoff_slider.set_bounds(self._cut_lo, self._cut_hi)
         self._update_cutoff_label()
@@ -783,8 +902,8 @@ class MatrixApp(tk.Tk):
     # Colours
     #
     # Without a colormap, low scores are light grey and high scores dark grey.
-    # With one, the colour comes from the colormap, scaled either linearly or
-    # by rank (quantile).
+    # With one, the colour comes from the colormap and follows the rank of
+    # the score among all scores (quantile).
     # -------------------------------------------------------------------------
 
     def _on_colormap_change(self) -> None:
@@ -794,22 +913,35 @@ class MatrixApp(tk.Tk):
         else:
             self._cmap_name = name
             self._cmap_lut = _make_lut(name)
-        self._pg_cache.clear()
-        self._schedule()
-
-    def _on_norm_change(self) -> None:
-        self._norm_mode = self._norm_var.get()
+        self._cell_rgb = self._colours_for(self._cell_scores)
         self._pg_cache.clear()
         self._schedule()
 
     def _cell_colour(self, score: float) -> tuple[int, int, int]:
         if self._cmap_lut is not None:
-            quantile = self._score_sorted if self._norm_mode == "quantile" else None
-            return _score_to_bg(score, self._min_score, self._max_score, self._cmap_lut, quantile)
+            return _score_to_bg(score, self._cmap_lut, self._score_sorted)
         mn, mx = self._min_score, self._max_score
         grey = int(200 - (score - mn) / (mx - mn) * 160) if mx > mn else 120
         grey = max(40, min(200, grey))
         return grey, grey, grey
+
+    def _colours_for(self, scores: np.ndarray) -> np.ndarray:
+        """The same as _cell_colour, but for many scores at once. Gives one
+        RGB row per score."""
+        mn, mx = self._min_score, self._max_score
+        if self._cmap_lut is None:
+            if mx > mn:
+                grey = (200 - (scores - mn) / (mx - mn) * 160).astype(np.int64)
+            else:
+                grey = np.full(len(scores), 120, dtype=np.int64)
+            grey = np.clip(grey, 40, 200).astype(np.uint8)
+            return np.stack([grey, grey, grey], axis=1)
+        ranked = self._score_sorted
+        if len(ranked) > 0:
+            idx = (np.searchsorted(ranked, scores) / len(ranked) * 255).astype(np.int64)
+        else:
+            idx = np.full(len(scores), 128, dtype=np.int64)
+        return self._cmap_lut[np.clip(idx, 0, 255)]
 
     @staticmethod
     def _cell_text(score: float, cell_px: int) -> str | None:
@@ -828,9 +960,8 @@ class MatrixApp(tk.Tk):
 
     def _on_cutoff(self, lo: float, hi: float) -> None:
         self._cut_lo, self._cut_hi = lo, hi
-        if self._block_size > 1:
-            self._recompute_block_buckets()
-            self._reduce_block_scores()
+        self._group_links()
+        self._reduce_block_scores()
         self._update_cutoff_label()
         self._schedule()
 
@@ -861,8 +992,18 @@ class MatrixApp(tk.Tk):
     # maximum of the crosslinks inside it.
     # -------------------------------------------------------------------------
 
-    def _on_zoom(self, value: str) -> None:
+    def _on_zoom(self, value: str, anchor: tuple[float, float] | None = None) -> None:
+        """Called by the zoom slider and by the mouse wheel. The spot under
+        `anchor` (in canvas pixels; the middle of the view if not given)
+        stays where it is while everything around it grows or shrinks."""
         v = int(float(value))
+        if v == self._zoom_value:
+            return   # the slider only reports what the wheel has already done
+        self._zoom_value = v
+        ax, ay = anchor or (self._mx.winfo_width() / 2, self._mx.winfo_height() / 2)
+        item_x = self._item_at(self._mx.canvasx(0) + ax)
+        item_y = self._item_at(self._mx.canvasy(0) + ay)
+
         if v >= CELL_PX_MIN:
             self._cell_px = v
             block_size = 1
@@ -878,8 +1019,31 @@ class MatrixApp(tk.Tk):
             self._block_size = block_size
             self._recompute_blocks()
             self._pg_cache.clear()
+            if self._selected_items is not None:
+                # the selected items now sit in other blocks
+                self._select_block(*(self._item_to_block[i] for i in self._selected_items))
         self._update_scrollregion()
-        self._schedule()
+        self._scroll_to(self._pixel_of(item_x) - ax, self._pixel_of(item_y) - ay)
+
+    def _item_at(self, pixel: float) -> float:
+        """Which item lies at this pixel of the whole matrix. The answer has
+        decimals (2.5 = the middle of item 2), so that a spot can be found
+        again exactly after zooming."""
+        n = len(self._blocks)
+        if n == 0:
+            return 0.0
+        pos = min(max(pixel / self._cell_px, 0), n)
+        block = min(int(pos), n - 1)
+        start, end = self._blocks[block]
+        return start + (pos - block) * (end - start)
+
+    def _pixel_of(self, item: float) -> float:
+        """The opposite of _item_at."""
+        if not self._blocks:
+            return 0.0
+        block = self._item_to_block[min(int(item), len(self._proteins) - 1)]
+        start, end = self._blocks[block]
+        return (block + (item - start) / (end - start)) * self._cell_px
 
     def _on_agg_method_change(self) -> None:
         self._agg_method = _AGG_METHODS.get(self._agg_method_var.get(), "mean")
@@ -910,35 +1074,46 @@ class MatrixApp(tk.Tk):
         self._blocks = blocks
         self._item_to_block = [bi for bi, (s, e) in enumerate(blocks) for _ in range(s, e)]
         self._split_block = self._item_to_block[split] if 0 <= split < n else len(blocks)
-        self._recompute_block_buckets()
+        self._group_links()
         self._reduce_block_scores()
 
-    def _recompute_block_buckets(self) -> None:
-        """Sort every visible crosslink into its block pair (row block of
-        Protein1, column block of Protein2). Hidden scores are left out, so
-        the block values only describe what you can see."""
-        buckets: dict[tuple[int, int], list[float]] = {}
-        if self._block_size > 1:
-            for (pi, pj), score in self._sparse.items():
-                if not self._in_cutoff(score):
-                    continue
-                bi = self._item_to_block[self._item_index[pi]]
-                bj = self._item_to_block[self._item_index[pj]]
-                buckets.setdefault((bi, bj), []).append(score)
-        self._block_pair_raw = buckets
+    def _group_links(self) -> None:
+        """Sort every visible crosslink into its cell (row block of Protein1,
+        column block of Protein2). Hidden scores are left out, so the block
+        values only describe what you can see."""
+        scores = self._link_scores
+        keep = (scores >= self._cut_lo) & (scores <= self._cut_hi)
+        to_block = np.array(self._item_to_block, dtype=np.int64)
+        n = max(1, len(self._blocks))
+        cell = to_block[self._link_rows[keep]] * n + to_block[self._link_cols[keep]]
+        # a stable sort keeps the crosslinks of one cell in their original order
+        order = np.argsort(cell, kind="stable")
+        cell = cell[order]
+        first = np.flatnonzero(np.diff(cell, prepend=-1))   # where the next cell begins
+        self._cell_rows, self._cell_cols = np.divmod(cell[first], n)
+        self._group_scores = scores[keep][order].tolist()
+        self._group_starts = first.tolist() + [len(cell)]
 
     def _reduce_block_scores(self) -> None:
-        self._block_scores = {k: _aggregate(v, self._agg_method) for k, v in self._block_pair_raw.items()}
-        self._block_pair_n = {k: len(v) for k, v in self._block_pair_raw.items()}
+        """Turn the crosslinks of every cell into the one score it shows."""
+        scores, starts = self._group_scores, self._group_starts
+        if self._block_size > 1:
+            values = _aggregate_groups(scores, starts, self._agg_method)
+        else:
+            values = scores   # one item per block, so a cell holds exactly one crosslink
+        self._cell_scores = np.array(values, dtype=float)
+        self._cell_rgb = self._colours_for(self._cell_scores)
 
-    def _block_score(self, rb: int, cb: int) -> float | None:
-        """The value of the cell at (row block, column block), or None if it's
-        empty. Only crosslinks with Protein1 in the row and Protein2 in the
-        column count."""
-        if self._block_size <= 1:
-            score = self._sparse.get((self._proteins[rb], self._proteins[cb]))
-            return score if score is not None and self._in_cutoff(score) else None
-        return self._block_scores.get((rb, cb))
+    def _cell_at(self, rb: int, cb: int) -> tuple[float, int] | None:
+        """The score shown in the cell at (row block, column block) and how
+        many crosslinks went into it, or None if the cell is empty. Only
+        crosslinks with Protein1 in the row and Protein2 in the column count."""
+        n = max(1, len(self._blocks))
+        # the cells are sorted row by row, so the right one can be looked up
+        k = int(np.searchsorted(self._cell_rows * n + self._cell_cols, rb * n + cb))
+        if k == len(self._cell_rows) or (self._cell_rows[k], self._cell_cols[k]) != (rb, cb):
+            return None
+        return float(self._cell_scores[k]), self._group_starts[k + 1] - self._group_starts[k]
 
     # -------------------------------------------------------------------------
     # Clicking on a cell
@@ -946,9 +1121,6 @@ class MatrixApp(tk.Tk):
     # Shows both proteins, their scores in both directions, and fetches the
     # full protein names from UniProt in the background.
     # -------------------------------------------------------------------------
-
-    def _on_click(self, event: tk.Event) -> None:
-        self._select_at(event.x, event.y)
 
     def _select_at(self, x: int, y: int) -> None:
         """Select the block under the mouse, or clear the selection if the
@@ -959,6 +1131,7 @@ class MatrixApp(tk.Tk):
         cb = (x + int(self._mx.canvasx(0))) // cp
         rb = (y + int(self._mx.canvasy(0))) // cp
         if 0 <= rb < n and 0 <= cb < n:
+            self._selected_items = (self._blocks[rb][0], self._blocks[cb][0])
             self._select_block(rb, cb)
         else:
             self._clear_selection()
@@ -966,6 +1139,7 @@ class MatrixApp(tk.Tk):
 
     def _clear_selection(self) -> None:
         self._selected = None
+        self._selected_items = None
         self._sel_token += 1
         self._sel_info_var.set("")
 
@@ -1038,10 +1212,10 @@ class MatrixApp(tk.Tk):
                 return "(no crosslink)"
             hidden = "" if self._in_cutoff(score) else " (hidden by cutoff)"
             return f"score: {score:.4f}{hidden}"
-        score = self._block_scores.get((rb, cb))
-        if score is None:
+        cell = self._cell_at(rb, cb)
+        if cell is None:
             return "(no crosslinks)"
-        n_links = self._block_pair_n.get((rb, cb), 0)
+        score, n_links = cell
         return f"{_AGG_NAMES[self._agg_method]} of {n_links} crosslink(s): {score:.4f}"
 
     def _fetch_uniprot(self, accession: str) -> tuple[str, int] | None:
@@ -1090,16 +1264,45 @@ class MatrixApp(tk.Tk):
             self._draw_matrix_numpy()
 
     def _visible_cells(self):
-        """Every visible cell that has a value, as (x, y, colour, text) in
-        pixels relative to the top-left corner of the matrix canvas."""
+        """Every visible cell that has a value: the visible row and column
+        blocks, then one array each for the cells' row block, column block,
+        score and colour."""
+        rows, cols = self._visible_blocks()
+        r, c = self._cell_rows, self._cell_cols
+        seen = (r >= rows.start) & (r < rows.stop) & (c >= cols.start) & (c < cols.stop)
+        return rows, cols, r[seen], c[seen], self._cell_scores[seen], self._cell_rgb[seen]
+
+    def _matrix_pixels(self, w: int, h: int) -> np.ndarray:
+        """The visible part of the matrix as an RGB array of w x h pixels.
+        The cells are first painted with a single pixel each and then blown
+        up to the cell size. That's much faster than painting them one by one."""
         cp = self._cell_px
         ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
-        rows, cols = self._visible_blocks()
-        for rb in rows:
-            for cb in cols:
-                score = self._block_score(rb, cb)
-                if score is not None:
-                    yield cb * cp - ox, rb * cp - oy, self._cell_colour(score), self._cell_text(score, cp)
+        rows, cols, r, c, _, rgb = self._visible_cells()
+        frame = np.full((h, w, 3), 255, dtype=np.uint8)
+        if len(rows) and len(cols):
+            small = np.full((len(rows), len(cols), 3), 255, dtype=np.uint8)
+            small[r - rows.start, c - cols.start] = rgb
+            big = small.repeat(cp, axis=0).repeat(cp, axis=1)
+            # the first visible cell usually starts a little outside the canvas
+            x, y = cols.start * cp - ox, rows.start * cp - oy
+            part = big[max(0, -y):, max(0, -x):]
+            target = frame[max(0, y):, max(0, x):]
+            ph, pw = min(len(part), len(target)), min(part.shape[1], target.shape[1])
+            target[:ph, :pw] = part[:ph, :pw]
+        return frame
+
+    def _score_texts(self):
+        """The scores that are written into the visible cells, as (x, y,
+        colour, text) with the top-left corner of the cell. Gives nothing
+        while the cells are too small for text."""
+        cp = self._cell_px
+        if cp < SCORE_THRESHOLD_PX:
+            return
+        ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
+        _, _, r, c, scores, _ = self._visible_cells()
+        for rb, cb, score in zip(r.tolist(), c.tolist(), scores.tolist()):
+            yield cb * cp - ox, rb * cp - oy, self._cell_colour(score), self._cell_text(score, cp)
 
     def _overlay_positions(self) -> tuple[int, int, tuple[int, int] | None]:
         """Where the target/decoy lines go (None if there are no decoys) and
@@ -1119,16 +1322,16 @@ class MatrixApp(tk.Tk):
         self._pg_sync_size()
         w, h = self._pg_size
         screen, cp = self._pg_frame, self._cell_px
-        screen.fill(_BG)
+        _pygame.surfarray.blit_array(screen, self._matrix_pixels(w, h).swapaxes(0, 1))
 
-        for x, y, colour, text in self._visible_cells():
+        # cells with a score written into them are drawn on top, one by one
+        for x, y, colour, text in self._score_texts():
             surf = self._pg_cache.get((colour, text))
             if surf is None:
                 surf = _pygame.Surface((cp, cp))
                 surf.fill(colour)
-                if text:
-                    ts = self._pg_font.render(text, True, _auto_fg(colour), colour)
-                    surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
+                ts = self._pg_font.render(text, True, _auto_fg(colour), colour)
+                surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
                 self._pg_cache[(colour, text)] = surf
             screen.blit(surf, (x, y))
 
@@ -1146,21 +1349,11 @@ class MatrixApp(tk.Tk):
         c = self._mx
         w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
         cp = self._cell_px
-        arr = np.full((h, w, 3), 255, dtype=np.uint8)
-        texts: list[tuple[int, int, str, tuple[int, int, int]]] = []
-
-        for x, y, colour, text in self._visible_cells():
-            y0, y1 = max(0, y), min(h, y + cp)
-            x0, x1 = max(0, x), min(w, x + cp)
-            if y1 > y0 and x1 > x0:
-                arr[y0:y1, x0:x1] = colour
-                if text:
-                    texts.append((x + cp // 2, y + cp // 2, text, _auto_fg(colour)))
-
-        img = Image.fromarray(arr)
+        img = Image.fromarray(self._matrix_pixels(w, h))
         draw = ImageDraw.Draw(img)
-        for cx, cy, text, fg in texts:
-            draw.text((cx, cy), text, font=self._pil_cf, anchor="mm", fill=fg)
+        for x, y, colour, text in self._score_texts():
+            mask, mx, my = self._text_mask(text)
+            img.paste(_auto_fg(colour), (x + cp // 2 - mx, y + cp // 2 - my), mask)
 
         sx, sy, sel = self._overlay_positions()
         if sx is not None:
@@ -1174,6 +1367,39 @@ class MatrixApp(tk.Tk):
         self._mx_photo = ImageTk.PhotoImage(img)
         c.delete("all")
         c.create_image(int(c.canvasx(0)), int(c.canvasy(0)), image=self._mx_photo, anchor="nw")
+
+    def _text_mask(self, text: str) -> tuple[Image.Image, int, int]:
+        """A score written once and kept: a greyscale picture of the text,
+        and where its centre is inside that picture."""
+        cached = self._text_cache.get(text)
+        if cached is None:
+            w, h = 10 * self._cell_px, 2 * self._cell_px
+            img = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(img).text((w // 2, h // 2), text, font=self._pil_cf, anchor="mm", fill=255)
+            box = img.getbbox() or (0, 0, 1, 1)
+            cached = self._text_cache[text] = (img.crop(box), w // 2 - box[0], h // 2 - box[1])
+        return cached
+
+    def _label_image(self, text: str, vertical: bool) -> Image.Image:
+        """A name written once and kept, as a greyscale picture that is
+        pasted wherever the name is needed. vertical puts the letters below
+        each other, like in the column headers; the middle of the letters is
+        then at x = line height."""
+        key = (text, vertical)
+        img = self._label_cache.get(key)
+        if img is None:
+            lh, font = self._ch, self._pil_lf
+            if vertical:
+                img = Image.new("L", (2 * lh, max(1, lh * len(text))), 0)
+                draw = ImageDraw.Draw(img)
+                for k, char in enumerate(text):
+                    if char != " ":
+                        draw.text((lh, k * lh + lh // 2), char, font=font, anchor="mm", fill=255)
+            else:
+                img = Image.new("L", (self._label_w, 2 * lh), 0)
+                ImageDraw.Draw(img).text((2, lh), text, font=font, anchor="lm", fill=255)
+            self._label_cache[key] = img
+        return img
 
     def _section_runs(self, first_items: list, split: int):
         """Runs of neighbouring slots with the same section name, as
@@ -1220,13 +1446,11 @@ class MatrixApp(tk.Tk):
         # Names written top to bottom, but only above single items. On a merged
         # block a name would look as if the whole block were that one protein.
         labels = self._col_labels
-        for char_idx in range(max((len(lb) for lb in labels), default=0)):
-            for cb in cols:
-                s, e = self._blocks[cb]
-                if e - s == 1 and char_idx < len(labels[s]) and labels[s][char_idx] != " ":
-                    draw.text((cb * cp + cp // 2 - ox, y + lh // 2), labels[s][char_idx],
-                              font=font, anchor="mm", fill=_FG)
-            y += lh
+        for cb in cols:
+            s, e = self._blocks[cb]
+            if e - s == 1 and labels[s]:
+                img.paste(_FG, (cb * cp + cp // 2 - ox - lh, y), self._label_image(labels[s], True))
+        y += lh * max((len(lb) for lb in labels), default=0)
 
         draw.line([(0, y), (w, y)], fill=_SEP, width=1)
         if has_sep:
@@ -1254,7 +1478,7 @@ class MatrixApp(tk.Tk):
             else:  # a merged block shows the name of its section instead
                 label = self._section.get(self._proteins[s], "") if self._section is not None else ""
             if label:
-                draw.text((2, rb * cp + cp // 2 - oy), label, font=self._pil_lf, anchor="lm", fill=_FG)
+                img.paste(_FG, (0, rb * cp + cp // 2 - oy - self._ch), self._label_image(label, False))
 
         if 0 < split < n and 0 <= split * cp - oy <= h:
             draw.line([(0, split * cp - oy), (w, split * cp - oy)], fill=_SEP, width=1)

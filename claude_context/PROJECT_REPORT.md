@@ -151,36 +151,54 @@ ordering / console rendering / CLI.
 
 ### 4.5 `gui/matrix_app.py`
 Module helpers: `_find_pil_font`, `_make_lut` (`matplotlib.colormaps`), `_score_to_bg`
-(linear or quantile via searchsorted), `_auto_fg`, `_aggregate(values, method)`.
+(quantile via searchsorted only — the linear colormap scale and the Norm control were removed 2026-10-10 on user request; greyscale without a colormap is still linear), `_auto_fg`, `_aggregate(values, method)`.
 `RangeSlider(tk.Canvas)`: custom two-handle slider (`set_bounds`, `values`, `command` while
 dragging, `release_command` on release; handles can't cross; ends map exactly to min/max).
 `MatrixApp(tk.Tk)`, sectioned with comment banners (use grep for line numbers):
 - **UI construction:** `_build_sidebar()` = fixed-width (`SIDEBAR_W=270`) **left panel**, vertically
   scrollable via `_scrollable()` (global `<MouseWheel>` binding that only acts when the pointer is over
   the panel). Groups: **Data** (CSV/FASTA, Level, only-linked, N, Order, Species, Load, Export, status),
-  **Display** (Colormap, Norm, Zoom, Aggregate), **Score cutoff** (RangeSlider, label, Reset),
+  **Display** (Colormap, Zoom, Aggregate), **Score cutoff** (RangeSlider, label, Reset),
   **Selection** (wrapped info text); footer = item count + renderer. No top bar / status bar any more
   (added 2026-09-30 on user request: bigger matrix area). Matrix grid packs to the right of it.
-  `_init_pygame` embeds SDL via `SDL_WINDOWID`. pygame renders into an off-screen `_pg_frame` only from `_redraw` (real changes); `_pg_loop` (16 ms) just polls pygame events (`_poll_pygame_events`: left click → `_select_at`) and re-shows the frame via `_present()` (~0.4 ms; `_pg_sync_size` handles resize). Render errors go to `_report_render_error` (stderr + status line, once per message). Tk `<MouseWheel>` works over the SDL window (verified with real OS input), no forwarding needed.
+  `_init_pygame` embeds SDL via `SDL_WINDOWID` into `_pg_host`, a background-less `tk.Frame` placed over the whole matrix canvas (since 2026-10-10: drawing straight into the canvas flashed white, because Tk repaints the canvas after every scroll step; changing the canvas cursor did the same, so the drag cursor is set through pygame). Over that frame the mouse buttons only reach pygame; the wheel is bound on the frame, the arrow keys on `_mx`. pygame renders into an off-screen `_pg_frame` only from `_redraw` (real changes); `_pg_loop` (16 ms) just polls pygame events (`_poll_pygame_events`: left button down/motion/up → `_press`/`_drag_to`/`_release`) and re-shows the frame via `_present()` (~0.4 ms; `_pg_sync_size` handles resize). Render errors go to `_report_render_error` (stderr + status line, once per message). Tk `<MouseWheel>` works over the SDL window (verified with real OS input), no forwarding needed.
 - **Score cutoff** (user request 2026-09-30): `_cut_lo/_cut_hi` (reset to min/max score on each load),
   `_in_cutoff(score)` inclusive. Applied in `_block_score` (single cells), `_recompute_block_buckets`
   (filtered *before* aggregation, so counts/aggregates only use visible links), `_render_full_image`,
   and `_direction_score` (shows `(hidden by cutoff)`). Colours deliberately keep the **full-range**
   scale (user decision). `_on_cutoff` re-buckets + redraws; `_on_cutoff_release` refreshes selection.
-- **Geometry & scrolling** (400): `_visible_blocks()` → (row range, col range); `_schedule()` coalesces redraws.
+- **Geometry & scrolling**: `_visible_blocks()` → (row range, col range); `_schedule()` coalesces redraws;
+  `_scroll_to(ox, oy)` = pixel-exact view position on all three canvases (Tk clamps to the scroll region).
+- **Moving around with the mouse** (added 2026-10-10, user request "like Google Maps"): `_wheel` zooms
+  around the pointer (calls `_on_zoom(v, anchor)` then moves the slider; step = 15 % of the cell size, 1 slider
+  step in the block range; the wheel no longer scrolls). `_press`/`_drag_to`/`_release` are shared by the Tk
+  bindings and the pygame events: moving more than `DRAG_THRESHOLD_PX` pans via `_scroll_to`, otherwise the
+  release is a click → `_select_at`. A pygame motion event without the button ends a drag (lost button-up).
 - **Loading** (459): `_load` validates, worker thread runs the CLI pipeline, `after(0)` → `_on_loaded`.
 - **Colours** (561): `_cell_colour(score)` (colormap LUT or greyscale 200→40), `_cell_text(score, px)`
   (score text at ≥18 px). Used by both renderers and export.
-- **Zoom & blocks** (596): slider −16..32; <4 → cell 4 px, `block_size = round(1.3^(4−v))` ∈ [2,500].
-  `_recompute_blocks` (never crosses split/section), buckets keyed **directionally `(bi, bj)`**,
-  `_reduce_block_scores` via `_aggregate`, `_block_score(rb, cb)` = the cell value.
-- **Selection** (676): `_select_at(x, y)` is shared by Tk clicks and pygame events → `_select_block`
+- **Zoom & blocks**: slider −16..32; <4 → cell 4 px, `block_size = round(1.3^(4−v))` ∈ [2,500].
+  `_on_zoom(value, anchor=None)` keeps the item under the anchor (default: view centre) in place via
+  `_item_at`/`_pixel_of` (fractional item positions, because blocks change what a pixel covers); it ignores a
+  value equal to `_zoom_value` (Tk's Scale fires its command late, after the wheel already applied it).
+  `_recompute_blocks` (never crosses split/section) → `_group_links` (numpy: links → cells, cutoff applied,
+  stable sort so sums keep the old order; **directional** key `row block * n + col block`) →
+  `_reduce_block_scores` (`_aggregate_groups`; exact same floats as before). Result = cell arrays
+  `_cell_rows/_cell_cols/_cell_scores/_cell_rgb` (sorted row by row) used for drawing; `_cell_at(rb, cb)` =
+  (value, link count) for the selection text. The old dicts `_block_scores`/`_block_pair_n`/`_block_pair_raw`
+  and `_block_score()` are gone.
+- **Selection**: `_selected_items` remembers the clicked row/column item, so zooming re-selects the block
+  that contains them; `_on_loaded` clears the selection. `_select_at(x, y)` (called from `_release`) → `_select_block`
   shows `_describe_side` for row/col + `_score_line`, then a UniProt fetch thread (only if each side
   is one protein; `_sel_token` guards stale replies; `_clear_selection` also bumps the token).
   `_score_line` shows **both directions**: `row→col … | col→row …` (single line on the diagonal).
-- **Rendering** (793): `_visible_cells()` yields (x, y, colour, text); `_draw_matrix_pygame` (cell
-  surface cache keyed (colour, text)) / `_draw_matrix_numpy`; `_overlay_positions` for separator +
-  highlight; `_section_runs` shared by header + export; `_draw_col_headers`, `_draw_row_labels`.
+- **Rendering** (reworked 2026-10-10 for speed, pictures verified identical): `_visible_cells()` masks the
+  cell arrays to the viewport; `_matrix_pixels(w, h)` paints one pixel per cell and `repeat`s it up to the
+  cell size (shared by both renderers; pygame gets it via `surfarray.blit_array`); `_score_texts()` yields the
+  cells that get a score written in (≥18 px) — pygame cell-surface cache keyed (colour, text), numpy pastes
+  cached `_text_mask`s; `_colours_for(scores)` = array version of `_cell_colour`. Headers/labels paste cached
+  `_label_image(text, vertical)` masks instead of `draw.text` per character. `_overlay_positions` for
+  separator + highlight; `_section_runs` shared by header + export.
 - **Export** (990): `_render_full_image` — full matrix, one cell per item (no aggregation),
   `cp = min(cell_px, 16)` → never shows score text.
 
@@ -257,15 +275,16 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 9. STRING gene matching is substring-based → possible false memberships.
 10. Residue-mode CLI section headers render as `==` for proteins with 1–2 residues (by design).
 11. `print_matrix.py` rewraps `sys.stdout` at import time (also when the GUI imports it).
-13. **Stale selection (reproduced 2026-09-30):** `_selected` (block indices) is not cleared on
+13. (FIXED 2026-10-10, see Selection in §4.5) **Stale selection (reproduced 2026-09-30):** `_selected` (block indices) is not cleared on
     `_on_loaded` or when zoom changes the blocks → highlight on the wrong cell, and
     `_on_cutoff_release` → `_select_block` raises IndexError after zooming out / loading smaller data.
 14. **N spinbox:** non-numeric N → `self._n_var.get()` raises TclError in `_load` (uncaught, silent).
-15. Clicking the matrix doesn't `focus_set()` it → arrow keys stop working after using a sidebar field.
-16. Scrolling perf measured: at 4 px a scroll step costs ~100–135 ms (per-cell Python loops +
-    per-char PIL header text), (pygame idle loop fixed separately); Tk canvas scrolling
-    exposes white strips. A fix plan (own scroll offsets + vectorised frame + cached glyphs) was drafted
-    but NOT implemented — user redirected to a whole-project review.
+15. (FIXED 2026-10-10) Clicking the matrix now calls `focus_set()` in `_press`.
+16. (FIXED 2026-10-10, user target: redraw ≤ 50 ms) Redraw measured in a 1500×950 window (matrix canvas
+    1111×758), median ms, before → after: pygame worst case 282 → 32 (2SDA Links N=1000, 4 px), numpy
+    renderer 340 → 48; zoom step into the block range 82 → 36. Remaining cost at 4 px is mostly the header
+    strip (~14 ms) and row labels (~6 ms). Tk canvas scrolling in the numpy renderer can still expose white
+    strips for a frame.
 12. `__pycache__` binaries are committed to git. Python files written by Claude use LF; git autocrlf converts.
 
 ---
@@ -319,6 +338,9 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 - Behaviour was verified unchanged after the restructure (18 CLI goldens identical; GUI harness 484
   pygame + 308 numpy states identical; cutoff/sidebar checks pass). Line numbers elsewhere in this
   report are outdated since — grep for function names.
+- 2026-10-10 harness (session scratchpad, not in repo): frame hashes of 324 view states × 2 datasets × 2
+  renderers were identical before/after the render rework; behaviour checks for anchor/drag/selection passed.
+  pygame mouse handling can be tested by `pygame.event.post` of MOUSEBUTTONDOWN/MOUSEMOTION/MOUSEBUTTONUP.
 - Test-harness lesson: GUI tests that use `winfo_containing` or real input need
   `app.attributes("-topmost", True)`, and runs can be disturbed by the user's own mouse while the
   window is open (seen as a scrolled first dataset) — repeat a run before trusting a diff.
