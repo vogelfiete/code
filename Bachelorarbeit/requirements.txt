@@ -1,0 +1,21 @@
+# Python packages for the XL-MS matrix tools (command line and GUI).
+# Needs Python 3.11 or newer. Install with:
+#
+#     python -m pip install -r requirements.txt
+#
+# Tkinter, which the GUI is built with, comes with Python and can't be
+# installed with pip. On Windows and macOS it is already there. On Linux it
+# is a separate system package, see docs/usage.md (Setup).
+#
+# Tested with the versions in brackets (Windows, Python 3.13).
+
+numpy>=1.24          # (2.5.3)
+pandas>=2.0          # (3.0.6)
+scipy>=1.10          # (1.18.1) for the "sequence" ordering
+biopython>=1.81      # (1.88)   for reading FASTA files
+Pillow>=10.1         # (12.3.0) for drawing the GUI and the PNG export
+
+# Optional, but recommended. Without matplotlib the GUI only has greyscale
+# cells; without pygame it draws with numpy/PIL, which is a bit slower.
+matplotlib>=3.7      # (3.11.2)
+pygame>=2.5          # (2.6.1)
