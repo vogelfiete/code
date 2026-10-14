@@ -8,11 +8,38 @@ as an interactive GUI.
 
 The project expects Python 3.11+ with `pandas`, `biopython`, `scipy`, `numpy`
 and `Pillow` installed. `matplotlib` and `pygame` are optional — without them
-the GUI falls back to greyscale cells and CPU-only (numpy) rendering.
+the GUI falls back to greyscale cells and CPU-only (numpy) rendering. All of
+them are listed in `requirements.txt`. From the `Bachelorarbeit` folder:
+
+**Windows**
 
 ```
-pip install pandas biopython scipy numpy Pillow matplotlib pygame
+python -m venv venv
+venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
+
+**Linux / macOS**
+
+```
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+The GUI needs Tkinter, which comes with Python on Windows and macOS. On Linux
+it is a system package that pip can't install:
+
+- Debian / Ubuntu: `sudo apt install python3-tk` (and `python3-venv` for the
+  venv step)
+- Fedora: `sudo dnf install python3-tkinter`
+- Arch: `sudo pacman -S tk`
+
+For the labels the GUI looks for a monospace font (Consolas on Windows,
+DejaVu Sans Mono or Liberation Mono on Linux, Menlo on macOS) and otherwise
+uses Pillow's built-in font. On Linux the pygame renderer is placed inside
+the Tk window, which works under X11 and XWayland. If the matrix stays empty,
+uninstall pygame (`python -m pip uninstall pygame`) to use the numpy renderer.
 
 ## Input data
 
@@ -171,8 +198,9 @@ options as the CLI, plus **Load**, **Export PNG…** and the load status.
 - **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
   score. Zooming below 4 px merges neighbouring items into blocks. The
   slider zooms around the middle of the view.
-- **Aggregate** — how a block's scores are combined: mean, geometric mean
-  or max.
+- **Aggregate** — what a block shows: the geometric mean of its scores
+  (default), the maximum score, or the count of crosslinks in it. Counts get
+  their own colour scale, by their rank among all counts on screen.
 
 **Score cutoff** — one slider with two handles: the left handle is the
 bottom limit, the right handle the top limit (both inclusive). Cells whose

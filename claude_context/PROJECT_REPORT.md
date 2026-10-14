@@ -42,6 +42,7 @@ Desktop/BA/
     ├── venv/             Python 3.13.2 venv (the one actually used; NOT .venv)
     ├── claude_context/   ← THIS REPORT
     └── Bachelorarbeit/
+        ├── requirements.txt     pip packages with minimum versions (2026-10-13); Linux setup notes in docs/usage.md
         ├── pyrightconfig.json   points to ../.venv (WRONG — real venv is ../venv)
         ├── data/example_500.csv synthetic: 31,525 rows, 482 proteins, cols Protein1,Protein2,Score only
         ├── docs/usage.md        user-facing docs (CRLF line endings; keep in sync with features)
@@ -63,7 +64,7 @@ Desktop/BA/
   protein–protein interaction evidence.
 - **Target/Decoy:** searches include decoy proteins; links are **TT / TD / DD**. The tool shows decoys
   as a separate block after targets (separator `|`/`+` in CLI, grey lines in GUI).
-- **Score:** search-engine score (higher = better). Scale differs per file (Links ~48–58, CSM ~24,
+- **Score:** search-engine score (higher = better). Scale differs per file (2SDA Links: median 1.75, 75 % below 2.7, max 58 — checked 2026-10-13; CSM ~24,
   ppi ~164–187, example CSV 0–1).
 - **xiFDR levels:** CSM (per spectrum) → PeptidePairs → **Links** (unique residue pairs) → **ppi**
   (protein pairs). ppi files list each pair in one direction only; Links/CSM contain both
@@ -183,7 +184,7 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
   value equal to `_zoom_value` (Tk's Scale fires its command late, after the wheel already applied it).
   `_recompute_blocks` (never crosses split/section) → `_group_links` (numpy: links → cells, cutoff applied,
   stable sort so sums keep the old order; **directional** key `row block * n + col block`) →
-  `_reduce_block_scores` (`_aggregate_groups`; exact same floats as before). Result = cell arrays
+  `_reduce_block_scores` (`_aggregate_groups`; exact same floats as before). Aggregate options since 2026-10-13 (user request): Geometric Mean (default), Max Score, Count — Mean removed (still used inside `_aggregate` as the geomean fallback). Count is coloured against `_colour_ref` = sorted cell counts instead of `_score_sorted`. Result = cell arrays
   `_cell_rows/_cell_cols/_cell_scores/_cell_rgb` (sorted row by row) used for drawing; `_cell_at(rb, cb)` =
   (value, link count) for the selection text. The old dicts `_block_scores`/`_block_pair_n`/`_block_pair_raw`
   and `_block_score()` are gone.

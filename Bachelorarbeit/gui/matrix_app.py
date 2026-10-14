@@ -9,7 +9,6 @@ blocks and their scores are combined."""
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import threading
@@ -70,8 +69,8 @@ SCORE_THRESHOLD_PX = 18   # from this cell size on, the score is written into ea
 BLOCK_ZOOM_STEPS = 20     # how many slider steps below CELL_PX_MIN are used for blocks
 BLOCK_ZOOM_GROWTH = 1.3   # each step makes blocks this much bigger (feels like a log zoom)
 BLOCK_SIZE_MAX = 500      # never merge more items than this into one block
-_AGG_METHODS = {"Mean": "mean", "Geometric Mean": "geomean", "Max Score": "max"}   # dropdown -> key
-_AGG_NAMES = {"mean": "Mean", "geomean": "Geometric mean", "max": "Max"}          # key -> info text
+_AGG_METHODS = {"Geometric Mean": "geomean", "Max Score": "max", "Count": "count"}   # dropdown -> key
+_AGG_NAMES = {"geomean": "Geometric mean", "max": "Max"}                            # key -> info text
 
 DRAG_THRESHOLD_PX = 4     # moving the mouse further than this with the button down is a drag, not a click
 WHEEL_ZOOM_STEP = 0.15    # one notch of the mouse wheel changes the cell size by about this share
@@ -84,10 +83,17 @@ _FG = (0, 0, 0)
 _SEP = (153, 153, 153)
 _HL = (0, 120, 215)  # outline of the selected cell
 
+# The first of these fonts that exists is used (Windows, then Linux, then
+# macOS). If none is found, Pillow's own font is used.
 _MONO_FONTS = [
     "C:/Windows/Fonts/consola.ttf",
     "C:/Windows/Fonts/cour.ttf",
     "C:/Windows/Fonts/lucon.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",           # Debian, Ubuntu
+    "/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf",    # Fedora
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",                       # Arch
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
 ]
 
 
@@ -131,27 +137,28 @@ def _auto_fg(bg_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
     return (0, 0, 0) if lum > 128 else (255, 255, 255)
 
 
-def _aggregate(values: list[float], method: str) -> float:
+def _aggregate_groups(scores: np.ndarray, starts: list[int], method: str) -> np.ndarray:
+    """Combine the scores of many groups at once, one value per group.
+    Group k is scores[starts[k]:starts[k+1]]. The method is "geomean"
+    (geometric mean), "max" (highest score) or "count" (number of scores)."""
+    if len(starts) < 2:
+        return np.zeros(0)
+    first, sizes = starts[:-1], np.diff(starts)
+    if method == "count":
+        return sizes.astype(float)
     if method == "max":
-        return max(values)
-    if method == "geomean":
-        positive = [v for v in values if v > 0]
-        if positive:
-            return math.exp(sum(math.log(v) for v in positive) / len(positive))
-        # A geometric mean needs positive numbers. Without any we use the
-        # normal mean, because dropping the block would make real crosslinks
-        # look like empty cells.
-    return sum(values) / len(values)
-
-
-def _aggregate_groups(scores: list[float], starts: list[int], method: str) -> list[float]:
-    """_aggregate for many groups at once. Group k is scores[starts[k]:starts[k+1]]."""
-    pairs = zip(starts, starts[1:])
-    if method == "mean":
-        # written out here, because this runs for every cell on every zoom
-        # step and calling _aggregate each time is too slow
-        return [scores[a] if b - a == 1 else sum(scores[a:b]) / (b - a) for a, b in pairs]
-    return [_aggregate(scores[a:b], method) for a, b in pairs]
+        return np.maximum.reduceat(scores, first)
+    # Geometric mean = exp(mean of the logarithms). Logarithms only exist for
+    # positive numbers, so scores of 0 or below are left out. A group without
+    # any positive score gets the normal mean instead, because dropping it
+    # would make real crosslinks look like an empty cell.
+    positive = scores > 0
+    logs = np.log(np.where(positive, scores, 1.0))   # the 1.0 is never used, it only avoids log(0)
+    n_positive = np.add.reduceat(positive.astype(int), first)
+    log_sum = np.add.reduceat(np.where(positive, logs, 0.0), first)
+    mean = np.add.reduceat(scores, first) / sizes
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(n_positive > 0, np.exp(log_sum / n_positive), mean)
 
 
 # -----------------------------------------------------------------------------
@@ -288,10 +295,10 @@ class MatrixApp(tk.Tk):
         self._blocks: list[tuple[int, int]] = []    # (start, end) of each block
         self._item_to_block: list[int] = []
         self._split_block: int = 0
-        self._agg_method: str = "mean"
+        self._agg_method: str = "geomean"
         # The crosslinks sorted into cells: _group_scores holds the scores cell
         # by cell, and cell k owns the part _group_starts[k]:_group_starts[k+1].
-        self._group_scores: list[float] = []
+        self._group_scores: np.ndarray = np.zeros(0)
         self._group_starts: list[int] = [0]
 
         # Every cell that has a value, row by row, ready for drawing
@@ -306,6 +313,9 @@ class MatrixApp(tk.Tk):
         self._min_score: float = 0.0
         self._max_score: float = 1.0
         self._score_sorted: np.ndarray = np.array([])
+        # What the cell colours are measured against: all scores, or with
+        # "Count" all the counts on screen. Sorted, for the quantile.
+        self._colour_ref: np.ndarray = np.array([])
 
         # Score cutoff: cells with a score outside [lo, hi] are hidden
         self._cut_lo: float = float("-inf")
@@ -452,7 +462,7 @@ class MatrixApp(tk.Tk):
         field(display, 2, "Zoom", self._zoom)
         tk.Label(display, textvariable=self._zoom_label_var, fg="gray").grid(
             row=3, column=1, columnspan=2, sticky="w", padx=(4, 0))
-        self._agg_method_var = tk.StringVar(value="Mean")
+        self._agg_method_var = tk.StringVar(value="Geometric Mean")
         field(display, 4, "Aggregate", ttk.Combobox(
             display, textvariable=self._agg_method_var, width=10, state="readonly",
             values=list(_AGG_METHODS),
@@ -926,9 +936,11 @@ class MatrixApp(tk.Tk):
         return grey, grey, grey
 
     def _colours_for(self, scores: np.ndarray) -> np.ndarray:
-        """The same as _cell_colour, but for many scores at once. Gives one
-        RGB row per score."""
-        mn, mx = self._min_score, self._max_score
+        """The colours of the cells, one RGB row per value. For scores this
+        is the same as _cell_colour. Counts get their own scale, from the
+        smallest to the largest count (see _reduce_block_scores)."""
+        ref = self._colour_ref
+        mn, mx = (ref[0], ref[-1]) if len(ref) else (0.0, 1.0)
         if self._cmap_lut is None:
             if mx > mn:
                 grey = (200 - (scores - mn) / (mx - mn) * 160).astype(np.int64)
@@ -936,7 +948,7 @@ class MatrixApp(tk.Tk):
                 grey = np.full(len(scores), 120, dtype=np.int64)
             grey = np.clip(grey, 40, 200).astype(np.uint8)
             return np.stack([grey, grey, grey], axis=1)
-        ranked = self._score_sorted
+        ranked = ref
         if len(ranked) > 0:
             idx = (np.searchsorted(ranked, scores) / len(ranked) * 255).astype(np.int64)
         else:
@@ -1046,7 +1058,7 @@ class MatrixApp(tk.Tk):
         return (block + (item - start) / (end - start)) * self._cell_px
 
     def _on_agg_method_change(self) -> None:
-        self._agg_method = _AGG_METHODS.get(self._agg_method_var.get(), "mean")
+        self._agg_method = _AGG_METHODS.get(self._agg_method_var.get(), "geomean")
         self._reduce_block_scores()
         self._pg_cache.clear()
         self._schedule()
@@ -1091,17 +1103,23 @@ class MatrixApp(tk.Tk):
         cell = cell[order]
         first = np.flatnonzero(np.diff(cell, prepend=-1))   # where the next cell begins
         self._cell_rows, self._cell_cols = np.divmod(cell[first], n)
-        self._group_scores = scores[keep][order].tolist()
+        self._group_scores = scores[keep][order]
         self._group_starts = first.tolist() + [len(cell)]
 
     def _reduce_block_scores(self) -> None:
-        """Turn the crosslinks of every cell into the one score it shows."""
+        """Turn the crosslinks of every cell into the one value it shows: a
+        score, or with "Count" the number of crosslinks."""
         scores, starts = self._group_scores, self._group_starts
         if self._block_size > 1:
             values = _aggregate_groups(scores, starts, self._agg_method)
         else:
             values = scores   # one item per block, so a cell holds exactly one crosslink
         self._cell_scores = np.array(values, dtype=float)
+        if self._block_size > 1 and self._agg_method == "count":
+            # counts aren't scores, so they are coloured by their rank among the counts
+            self._colour_ref = np.sort(self._cell_scores)
+        else:
+            self._colour_ref = self._score_sorted
         self._cell_rgb = self._colours_for(self._cell_scores)
 
     def _cell_at(self, rb: int, cb: int) -> tuple[float, int] | None:
@@ -1216,6 +1234,8 @@ class MatrixApp(tk.Tk):
         if cell is None:
             return "(no crosslinks)"
         score, n_links = cell
+        if self._agg_method == "count":
+            return f"{n_links} crosslink(s)"
         return f"{_AGG_NAMES[self._agg_method]} of {n_links} crosslink(s): {score:.4f}"
 
     def _fetch_uniprot(self, accession: str) -> tuple[str, int] | None:
