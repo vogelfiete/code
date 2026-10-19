@@ -218,9 +218,9 @@ def _classify_proteins(
 # "B,A" lands in row B, column A. The two are never merged.
 # -----------------------------------------------------------------------------
 
-def build_matrix(path: str, n: int = DEFAULT_N):
+def build_matrix(path: str, n: int | None = DEFAULT_N):
     """Build the protein-level matrix. Returns (proteins, sparse, is_decoy):
-        proteins — N protein names, targets first, then decoys, each group in
+        proteins — the N most confident protein names (all if n is None), targets first, then decoys, each group in
                    order of confidence
         sparse   — {(protein1, protein2): best score}, with the pair in the
                    same order as in the CSV row
@@ -229,13 +229,13 @@ def build_matrix(path: str, n: int = DEFAULT_N):
     return _build(path, n, level="protein")
 
 
-def build_residue_matrix(path: str, n: int = DEFAULT_N):
+def build_residue_matrix(path: str, n: int | None = DEFAULT_N):
     """Same as build_matrix, but every row and column is a single residue.
     The CSV needs residue position columns for this."""
     return _build(path, n, level="residue")
 
 
-def _build(path: str, n: int, level: str):
+def _build(path: str, n: int | None, level: str):
     df = pd.read_csv(path)
     lower = {c.lower(): c for c in df.columns}
     missing = [c for c in ("protein1", "protein2", "score") if c not in lower]
@@ -263,7 +263,7 @@ def _build(path: str, n: int, level: str):
         items1 = [ResidueId(p, x) if x is not None else None for p, x in zip(names1, pos1)]
         items2 = [ResidueId(p, x) if x is not None else None for p, x in zip(names2, pos2)]
 
-    # Pick the N most confident items, best score first
+    # Pick the N most confident items (all if n is None), best score first
     selected: dict = {}
     n_skiped = 0
     for name1, name2, a, b in zip(names1, names2, items1, items2):
@@ -274,7 +274,7 @@ def _build(path: str, n: int, level: str):
             continue
         selected.setdefault(a)
         selected.setdefault(b)
-        if len(selected) >= n:
+        if n is not None and len(selected) >= n:
             break
     if n_skiped:
         warnings.warn(f"{n_skiped} row(s) skipped: missing/ambiguous residue position")

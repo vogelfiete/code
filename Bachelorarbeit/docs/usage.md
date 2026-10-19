@@ -175,16 +175,16 @@ Opens a Tkinter window. All controls sit in a panel on the left, so the
 matrix uses the full window height; the panel scrolls (mouse wheel over it)
 if the window is too short to show everything. The panel has four groups:
 
-**Data** — the same CSV/FASTA/`--level`/`--n`/`--order`/`--species`
-options as the CLI, plus **Load**, **Export PNG…** and the load status.
+**Data** — the same CSV/FASTA/`--level`/`--order`/`--species` options as
+the CLI, plus **Load**, **Export PNG…** and the load status. Unlike the CLI
+there is no `--n`: the GUI always loads all proteins or residues of the CSV
+(use zooming out and **Zoom to** to get an overview).
 
-- **Level** — `protein` (default) or `residue`; switches the axis unit and
-  updates the `N` label accordingly. Requires the CSV to have residue-
-  position columns (see above).
-- **Show only linked residues** — enabled only in residue mode. Checked
-  (default) matches the CLI default: only crosslinked residues are shown.
-  Unchecking it requires a FASTA file and adds every other residue of each
-  protein already in the matrix, same as `--include-unlinked`.
+- **Level** — `protein` (default) or `residue`; switches the axis unit.
+  Requires the CSV to have residue-position columns (see above). In residue
+  mode with a FASTA file, every residue of the loaded proteins is shown,
+  also those without crosslinks (like `--include-unlinked`); without a
+  FASTA only the crosslinked residues are shown.
 - **Export PNG…** — renders the full (unscrolled, un-aggregated) matrix to a
   PNG file, with the score cutoff applied.
 
@@ -197,10 +197,32 @@ options as the CLI, plus **Load**, **Export PNG…** and the load status.
   close together.
 - **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
   score. Zooming below 4 px merges neighbouring items into blocks. The
-  slider zooms around the middle of the view.
+  slider zooms around the middle of the view. Big matrices (e.g. residue
+  level) get extra zoom steps, so the whole matrix can be zoomed out to
+  about 200 px. Blocks never cross the target/decoy line. Sections (e.g.
+  the proteins in residue mode) smaller than a block are packed into one
+  block whole; bigger ones are cut into several blocks. While zoomed out
+  into blocks, the column headers and row labels are hidden (they can't be
+  read at that size anyway): the matrix uses the whole area, with a little
+  padding and a grey border around it.
+- **Zoom to** — **All** zooms and centers so that all quadrants that are
+  switched on fill the view (counting the space of the hidden labels when
+  the result is zoomed out into blocks); **TT**, **TD**, **DT** and **DD** do the same
+  for one quadrant and switch it on first if it was hidden. Buttons for
+  quadrants without items (e.g. no decoys loaded) are greyed out.
 - **Aggregate** — what a block shows: the geometric mean of its scores
-  (default), the maximum score, or the count of crosslinks in it. Counts get
-  their own colour scale, by their rank among all counts on screen.
+  (default), the maximum score, the root sum of squares of its scores
+  (√(s₁² + s₂² + …), which grows with both the scores and the number of
+  crosslinks), or the count of crosslinks in it. Root sums of squares and
+  counts get their own colour scale, by their rank among all values on
+  screen.
+
+**Quadrants** — four checkboxes, laid out like the matrix: **TT**
+(target row, target column), **TD** (target row, decoy column), **DT** and
+**DD**. Rows are Protein1, columns Protein2. Unchecking one hides all links
+in that quadrant; like the cutoff, they are then left out of block
+aggregates, the PNG export and the "links shown" count. A clicked cell in a
+hidden quadrant is marked `(hidden: TD quadrant)` and so on.
 
 **Score cutoff** — one slider with two handles: the left handle is the
 bottom limit, the right handle the top limit (both inclusive). Cells whose

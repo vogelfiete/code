@@ -159,10 +159,38 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
 - **UI construction:** `_build_sidebar()` = fixed-width (`SIDEBAR_W=270`) **left panel**, vertically
   scrollable via `_scrollable()` (global `<MouseWheel>` binding that only acts when the pointer is over
   the panel). Groups: **Data** (CSV/FASTA, Level, only-linked, N, Order, Species, Load, Export, status),
-  **Display** (Colormap, Zoom, Aggregate), **Score cutoff** (RangeSlider, label, Reset),
+  **Display** (Colormap, Zoom, Aggregate), **Quadrants** (TT/TD/DT/DD checkboxes, 2026-10-14), **Score cutoff** (RangeSlider, label, Reset),
   **Selection** (wrapped info text); footer = item count + renderer. No top bar / status bar any more
   (added 2026-09-30 on user request: bigger matrix area). Matrix grid packs to the right of it.
   `_init_pygame` embeds SDL via `SDL_WINDOWID` into `_pg_host`, a background-less `tk.Frame` placed over the whole matrix canvas (since 2026-10-10: drawing straight into the canvas flashed white, because Tk repaints the canvas after every scroll step; changing the canvas cursor did the same, so the drag cursor is set through pygame). Over that frame the mouse buttons only reach pygame; the wheel is bound on the frame, the arrow keys on `_mx`. pygame renders into an off-screen `_pg_frame` only from `_redraw` (real changes); `_pg_loop` (16 ms) just polls pygame events (`_poll_pygame_events`: left button down/motion/up → `_press`/`_drag_to`/`_release`) and re-shows the frame via `_present()` (~0.4 ms; `_pg_sync_size` handles resize). Render errors go to `_report_render_error` (stderr + status line, once per message). Tk `<MouseWheel>` works over the SDL window (verified with real OS input), no forwarding needed.
+- **Overview mode + section packing** (user request 2026-10-18): residue mode has one section per protein, so the
+  old "blocks never cross sections" rule kept 1023-protein CSM at ≥4092 px. Now `_blocks_for(bs)` packs whole
+  sections < bs into one block and cuts sections ≥ bs into bs pieces; never crosses split. `_extent_px` counts
+  `_blocks_for` blocks; `_find_zoom_min` stops when bs ≥ bigger split side. `_overview` (= block_size > 1, set in
+  `_on_zoom` via `_set_overview`): grid_remove corner/col headers/row labels, scrollregion padded by
+  `OVERVIEW_PAD_PX` (12; `_pad` property, `_scroll_to` accounts for it), grey border via `_matrix_box`, T/D lines
+  clipped to the matrix, label drawing skipped. `_on_zoom` keeps the anchor on screen across the layout shift.
+  `_zoom_to` fits with labels for v ≥ CELL_PX_MIN, with the full area minus padding below. Verified on SCE CSM
+  residue (15928 items): zoom_min −19 (160 px), "All" → bs 112, 652 px, centered. Test screenshots need
+  `SetProcessDpiAwareness(2)` (Windows scaling); that also inflates `_header_h` (Tk metrics scale, PIL fonts don't)
+  — same in the committed version, not a regression.
+- **No "Show only linked residues" checkbox** (user request 2026-10-18): removed with `_only_linked_var` and
+  `_on_level_change`. Residue mode adds unlinked residues whenever a FASTA is given (`if seqs:` in the load worker),
+  otherwise linked only. Data rows now: CSV 0, FASTA 1, Level 2, Order 3, Species 4, buttons 5, status 6.
+- **No N in the GUI** (user request 2026-10-18): the N spinbox is gone; the GUI calls `build_matrix`/
+  `build_residue_matrix` with `n=None` = all items (`_build` only stops early when n is not None). The CLI keeps
+  `--n` (default `DEFAULT_N`=1000). Data group rows: CSV 0, FASTA 1, Level 2, only-linked 3, Order 4, Species 5.
+- **Zoom to + deeper zoom-out** (user request 2026-10-14): `BLOCK_SIZE_MAX` removed. `_runs` (from `_find_runs`,
+  per load) = stretches that may share a block (same section, same side of split); `_recompute_blocks` chunks runs
+  (identical to the old greedy loop, verified). `_zoom_min` (from `_find_zoom_min`) lowers the slider's `from_`
+  until the whole matrix fits `ZOOM_OUT_FIT_PX` (200) or every run is one block; wheel clamps to it.
+  `_extent_px(v, start, end)` counts blocks run by run without recomputing; `_zoom_to(target)` picks the biggest v
+  where `_zoom_region(target)` fits the canvas, then centers. "All" = bounding box of shown quadrants.
+  Buttons in Display group ("Zoom to" row 4; Aggregate moved to row 5).
+- **Quadrant checkboxes** (user request 2026-10-14): `_QUADRANTS` index = 2*row_decoy + col_decoy (row = Protein1).
+  `_quad_shown` (plain dict, mirrors `_quad_vars`; read by the export thread). `_shown_links()` = cutoff AND quadrant
+  mask, used by `_group_links` and the "links shown" label; `_quadrant_shown(row, col)` in `_direction_score` and
+  `_render_full_image`. Blocks never cross the split, so each cell is in exactly one quadrant.
 - **Score cutoff** (user request 2026-09-30): `_cut_lo/_cut_hi` (reset to min/max score on each load),
   `_in_cutoff(score)` inclusive. Applied in `_block_score` (single cells), `_recompute_block_buckets`
   (filtered *before* aggregation, so counts/aggregates only use visible links), `_render_full_image`,
@@ -184,7 +212,7 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
   value equal to `_zoom_value` (Tk's Scale fires its command late, after the wheel already applied it).
   `_recompute_blocks` (never crosses split/section) → `_group_links` (numpy: links → cells, cutoff applied,
   stable sort so sums keep the old order; **directional** key `row block * n + col block`) →
-  `_reduce_block_scores` (`_aggregate_groups`; exact same floats as before). Aggregate options since 2026-10-13 (user request): Geometric Mean (default), Max Score, Count — Mean removed (still used inside `_aggregate` as the geomean fallback). Count is coloured against `_colour_ref` = sorted cell counts instead of `_score_sorted`. Result = cell arrays
+  `_reduce_block_scores` (`_aggregate_groups`; exact same floats as before). Aggregate options since 2026-10-13 (user request): Geometric Mean (default), Max Score, Count — Mean removed (still used inside `_aggregate` as the geomean fallback). 2026-10-14: added Root Sum of Squares (`"rss"`, sqrt(sum s²)). Count and RSS are coloured against `_colour_ref` = sorted cell values instead of `_score_sorted` (RSS grows past every single score). Result = cell arrays
   `_cell_rows/_cell_cols/_cell_scores/_cell_rgb` (sorted row by row) used for drawing; `_cell_at(rb, cb)` =
   (value, link count) for the selection text. The old dicts `_block_scores`/`_block_pair_n`/`_block_pair_raw`
   and `_block_score()` are gone.

@@ -40,7 +40,6 @@ sys.path.insert(0, os.path.join(_DIR, "..", "src"))
 
 from print_matrix import (  # type: ignore[import]
     COL_W,
-    DEFAULT_N,
     ORDER_MODES,
     ROW_W,
     add_unlinked_residues,
@@ -66,11 +65,14 @@ CELL_PX_MAX = 32
 CELL_PX_DEFAULT = 10
 SCORE_THRESHOLD_PX = 18   # from this cell size on, the score is written into each cell
 
-BLOCK_ZOOM_STEPS = 20     # how many slider steps below CELL_PX_MIN are used for blocks
+BLOCK_ZOOM_STEPS = 20     # at least this many slider steps below CELL_PX_MIN are used for blocks
 BLOCK_ZOOM_GROWTH = 1.3   # each step makes blocks this much bigger (feels like a log zoom)
-BLOCK_SIZE_MAX = 500      # never merge more items than this into one block
-_AGG_METHODS = {"Geometric Mean": "geomean", "Max Score": "max", "Count": "count"}   # dropdown -> key
-_AGG_NAMES = {"geomean": "Geometric mean", "max": "Max"}                            # key -> info text
+ZOOM_OUT_FIT_PX = 200     # big matrices get more block steps, until the whole matrix fits into this many pixels
+OVERVIEW_PAD_PX = 12      # zoomed out into blocks: empty space around the matrix
+_AGG_METHODS = {"Geometric Mean": "geomean", "Max Score": "max",
+                "Root Sum of Squares": "rss", "Count": "count"}                    # dropdown -> key
+_QUADRANTS = ["TT", "TD", "DT", "DD"]   # row target/decoy + column target/decoy; index = 2*row_decoy + col_decoy
+_AGG_NAMES = {"geomean": "Geometric mean", "max": "Max", "rss": "Root sum of squares"}  # key -> info text
 
 DRAG_THRESHOLD_PX = 4     # moving the mouse further than this with the button down is a drag, not a click
 WHEEL_ZOOM_STEP = 0.15    # one notch of the mouse wheel changes the cell size by about this share
@@ -140,7 +142,8 @@ def _auto_fg(bg_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
 def _aggregate_groups(scores: np.ndarray, starts: list[int], method: str) -> np.ndarray:
     """Combine the scores of many groups at once, one value per group.
     Group k is scores[starts[k]:starts[k+1]]. The method is "geomean"
-    (geometric mean), "max" (highest score) or "count" (number of scores)."""
+    (geometric mean), "max" (highest score), "rss" (square root of the sum
+    of the squared scores) or "count" (number of scores)."""
     if len(starts) < 2:
         return np.zeros(0)
     first, sizes = starts[:-1], np.diff(starts)
@@ -148,6 +151,8 @@ def _aggregate_groups(scores: np.ndarray, starts: list[int], method: str) -> np.
         return sizes.astype(float)
     if method == "max":
         return np.maximum.reduceat(scores, first)
+    if method == "rss":
+        return np.sqrt(np.add.reduceat(scores * scores, first))
     # Geometric mean = exp(mean of the logarithms). Logarithms only exist for
     # positive numbers, so scores of 0 or below are left out. A group without
     # any positive score gets the normal mean instead, because dropping it
@@ -293,6 +298,12 @@ class MatrixApp(tk.Tk):
         self._cell_px: int = CELL_PX_DEFAULT
         self._block_size: int = 1
         self._blocks: list[tuple[int, int]] = []    # (start, end) of each block
+        # (start, end) of the sections in axis order, also cut at the
+        # target/decoy line; blocks are built from these
+        self._runs: list[tuple[int, int]] = []
+        # Zoomed out into blocks the labels can't be read, so the headers
+        # and row labels are hidden and the matrix gets the whole area
+        self._overview: bool = False
         self._item_to_block: list[int] = []
         self._split_block: int = 0
         self._agg_method: str = "geomean"
@@ -333,6 +344,7 @@ class MatrixApp(tk.Tk):
         self._drag_start: tuple[int, int, float, float] | None = None
         self._dragging: bool = False
         self._zoom_value: int = CELL_PX_DEFAULT    # the zoom slider value that is shown right now
+        self._zoom_min: int = CELL_PX_MIN - BLOCK_ZOOM_STEPS   # lowest slider value; lower for big matrices
 
         # Fonts: the Tk font is only used for measuring, the PIL fonts for drawing
         self._lf: tkfont.Font | None = None
@@ -415,31 +427,20 @@ class MatrixApp(tk.Tk):
         self._level_var = tk.StringVar(value="protein")
         field(data, 2, "Level", ttk.Combobox(data, textvariable=self._level_var, width=10,
                                              state="readonly", values=["protein", "residue"]))
-        self._only_linked_var = tk.BooleanVar(value=True)
-        self._only_linked_check = tk.Checkbutton(
-            data, text="Show only linked residues", variable=self._only_linked_var,
-            state=tk.DISABLED,
-        )
-        self._only_linked_check.grid(row=3, column=0, columnspan=3, sticky="w")
-        self._level_var.trace_add("write", lambda *_: self._on_level_change())
-        self._n_label_var = tk.StringVar(value="N (proteins)")
-        self._n_var = tk.IntVar(value=DEFAULT_N)
-        field(data, 4, self._n_label_var,
-              tk.Spinbox(data, textvariable=self._n_var, from_=10, to=5000, width=8))
         self._order_var = tk.StringVar(value="confidence")
-        field(data, 5, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
+        field(data, 3, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
                                              state="readonly", values=ORDER_MODES))
         self._species_var = tk.StringVar(value="9606")
-        field(data, 6, "Species", tk.Entry(data, textvariable=self._species_var, width=10))
+        field(data, 4, "Species", tk.Entry(data, textvariable=self._species_var, width=10))
 
         buttons = tk.Frame(data)
-        buttons.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        buttons.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self._load_btn = tk.Button(buttons, text="Load", command=self._load, width=8)
         self._load_btn.pack(side=tk.LEFT)
         tk.Button(buttons, text="Export PNG…", command=self._export).pack(side=tk.LEFT, padx=4)
         self._status_var = tk.StringVar(value="No data loaded.")
         tk.Label(data, textvariable=self._status_var, fg="gray", wraplength=wrap,
-                 justify=tk.LEFT).grid(row=8, column=0, columnspan=3, sticky="w")
+                 justify=tk.LEFT).grid(row=6, column=0, columnspan=3, sticky="w")
 
         # Display: colours, zoom and how blocks are combined
         display = group("Display")
@@ -462,12 +463,33 @@ class MatrixApp(tk.Tk):
         field(display, 2, "Zoom", self._zoom)
         tk.Label(display, textvariable=self._zoom_label_var, fg="gray").grid(
             row=3, column=1, columnspan=2, sticky="w", padx=(4, 0))
+        # Zoom to: fit the shown quadrants, or one quadrant, into the view
+        zoom_to = tk.Frame(display)
+        self._zoom_to_btns: dict[str, tk.Button] = {}
+        for target in ["All", *_QUADRANTS]:
+            btn = tk.Button(zoom_to, text=target, width=3, padx=0,
+                            command=lambda t=target: self._zoom_to(t))
+            btn.pack(side=tk.LEFT, padx=(0, 2))
+            self._zoom_to_btns[target] = btn
+        field(display, 4, "Zoom to", zoom_to)
         self._agg_method_var = tk.StringVar(value="Geometric Mean")
-        field(display, 4, "Aggregate", ttk.Combobox(
+        field(display, 5, "Aggregate", ttk.Combobox(
             display, textvariable=self._agg_method_var, width=10, state="readonly",
             values=list(_AGG_METHODS),
         ))
         self._agg_method_var.trace_add("write", lambda *_: self._on_agg_method_change())
+
+        # Quadrants: show or hide target/decoy links (row = Protein1, column =
+        # Protein2), laid out like the quadrants in the matrix
+        quadrants = group("Quadrants")
+        self._quad_vars: dict[str, tk.BooleanVar] = {}
+        self._quad_shown: dict[str, bool] = {name: True for name in _QUADRANTS}   # copy of the checkboxes, safe to read from the export thread
+        for k, name in enumerate(_QUADRANTS):
+            var = tk.BooleanVar(value=True)
+            var.trace_add("write", lambda *_: self._on_quadrants_change())
+            self._quad_vars[name] = var
+            tk.Checkbutton(quadrants, text=name, variable=var).grid(
+                row=k // 2, column=k % 2, sticky="w", padx=(0, 12))
 
         # Score cutoff: lower and upper limit on one slider
         cutoff = group("Score cutoff")
@@ -522,11 +544,6 @@ class MatrixApp(tk.Tk):
 
         self.bind_all("<MouseWheel>", wheel, add="+")
         return inner
-
-    def _on_level_change(self) -> None:
-        level = self._level_var.get()
-        self._only_linked_check.configure(state=tk.NORMAL if level == "residue" else tk.DISABLED)
-        self._n_label_var.set(f"N ({level}s)")
 
     def _browse_csv(self) -> None:
         p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
@@ -699,11 +716,15 @@ class MatrixApp(tk.Tk):
     # bundled, so many scroll events in a row only cause one redraw.
     # -------------------------------------------------------------------------
 
+    @property
+    def _pad(self) -> int:
+        return OVERVIEW_PAD_PX if self._overview else 0
+
     def _update_scrollregion(self) -> None:
-        size = len(self._blocks) * self._cell_px
-        self._mx.configure(scrollregion=(0, 0, size, size))
-        self._ch_canvas.configure(scrollregion=(0, 0, size, self._header_h))
-        self._rl_canvas.configure(scrollregion=(0, 0, self._label_w, size))
+        size, pad = len(self._blocks) * self._cell_px, self._pad
+        self._mx.configure(scrollregion=(-pad, -pad, size + pad, size + pad))
+        self._ch_canvas.configure(scrollregion=(-pad, 0, size + pad, self._header_h))
+        self._rl_canvas.configure(scrollregion=(0, -pad, self._label_w, size + pad))
 
     def _yscroll(self, *args) -> None:
         self._mx.yview(*args)
@@ -727,12 +748,13 @@ class MatrixApp(tk.Tk):
     def _scroll_to(self, ox: float, oy: float) -> None:
         """Move the view so that pixel (ox, oy) of the whole matrix sits in
         the top-left corner. Tk keeps the view inside the matrix by itself."""
-        size = len(self._blocks) * self._cell_px
+        size, pad = len(self._blocks) * self._cell_px, self._pad
         if size:
-            self._mx.xview_moveto(ox / size)
-            self._ch_canvas.xview_moveto(ox / size)
-            self._mx.yview_moveto(oy / size)
-            self._rl_canvas.yview_moveto(oy / size)
+            fx, fy = (ox + pad) / (size + 2 * pad), (oy + pad) / (size + 2 * pad)
+            self._mx.xview_moveto(fx)
+            self._ch_canvas.xview_moveto(fx)
+            self._mx.yview_moveto(fy)
+            self._rl_canvas.yview_moveto(fy)
         self._schedule()
 
     def _visible_blocks(self) -> tuple[range, range]:
@@ -767,7 +789,7 @@ class MatrixApp(tk.Tk):
             v = v - 1 if v <= CELL_PX_MIN else max(CELL_PX_MIN, v - step)
         else:
             v = v + 1 if v < CELL_PX_MIN else v + step
-        v = min(max(v, CELL_PX_MIN - BLOCK_ZOOM_STEPS), CELL_PX_MAX)
+        v = min(max(v, self._zoom_min), CELL_PX_MAX)
         # ask Tk where the pointer is; that also works above the pygame window
         anchor = (self.winfo_pointerx() - self._mx.winfo_rootx(),
                   self.winfo_pointery() - self._mx.winfo_rooty())
@@ -821,22 +843,17 @@ class MatrixApp(tk.Tk):
         level = self._level_var.get()
         order = self._order_var.get()
         fasta = self._fasta_var.get().strip() or None
-        only_linked = self._only_linked_var.get()
         if not csv:
             messagebox.showerror("Error", "Please select a CSV file.")
             return
         if order == "sequence" and not fasta:
             messagebox.showerror("Error", "Order 'sequence' requires a FASTA file.")
             return
-        if level == "residue" and not only_linked and not fasta:
-            messagebox.showerror("Error", "Showing unlinked residues requires a FASTA file.")
-            return
         try:
             species = int(self._species_var.get())
         except ValueError:
             messagebox.showerror("Error", "Species must be an integer NCBI taxid.")
             return
-        n = self._n_var.get()
 
         self._load_btn.configure(state=tk.DISABLED)
         self._status_var.set("Loading…")
@@ -845,12 +862,14 @@ class MatrixApp(tk.Tk):
             try:
                 seqs = read_fasta(fasta) if fasta else None
                 if level == "residue":
-                    items, sparse, decoy = build_residue_matrix(csv, n=n)
-                    if not only_linked:
-                        items, decoy = add_unlinked_residues(items, decoy, seqs or {})
+                    items, sparse, decoy = build_residue_matrix(csv, n=None)   # always all residues
+                    if seqs:
+                        # with a FASTA, every residue of the loaded proteins is shown,
+                        # not only the crosslinked ones
+                        items, decoy = add_unlinked_residues(items, decoy, seqs)
                     items, section = sort_residues(items, decoy, order, seqs, species)
                 else:
-                    items, sparse, decoy = build_matrix(csv, n=n)
+                    items, sparse, decoy = build_matrix(csv, n=None)   # always all proteins
                     items, section = sort_proteins(items, decoy, order, seqs, species)
                 self.after(0, lambda: self._on_loaded(items, sparse, decoy, section, seqs, level))
             except Exception as exc:
@@ -888,7 +907,15 @@ class MatrixApp(tk.Tk):
         self._cut_lo, self._cut_hi = self._min_score, self._max_score
         self._cutoff_slider.set_bounds(self._cut_lo, self._cut_hi)
         self._update_cutoff_label()
+        self._runs = self._find_runs()
         self._recompute_blocks()
+        self._zoom_min = self._find_zoom_min()
+        self._zoom.configure(from_=self._zoom_min)
+        if self._zoom_value < self._zoom_min:   # the new matrix needs fewer block steps
+            self._on_zoom(str(self._zoom_min))
+            self._zoom.set(self._zoom_min)
+        for target, btn in self._zoom_to_btns.items():
+            btn.configure(state=tk.NORMAL if self._zoom_region(target) else tk.DISABLED)
 
         unit = "residues" if level == "residue" else "proteins"
         self._status_var.set(
@@ -937,8 +964,9 @@ class MatrixApp(tk.Tk):
 
     def _colours_for(self, scores: np.ndarray) -> np.ndarray:
         """The colours of the cells, one RGB row per value. For scores this
-        is the same as _cell_colour. Counts get their own scale, from the
-        smallest to the largest count (see _reduce_block_scores)."""
+        is the same as _cell_colour. Counts and root sums of squares get
+        their own scale, from the smallest to the largest value on screen
+        (see _reduce_block_scores)."""
         ref = self._colour_ref
         mn, mx = (ref[0], ref[-1]) if len(ref) else (0.0, 1.0)
         if self._cmap_lut is None:
@@ -970,6 +998,31 @@ class MatrixApp(tk.Tk):
     def _in_cutoff(self, score: float) -> bool:
         return self._cut_lo <= score <= self._cut_hi
 
+    def _quadrant_of(self, row: int, col: int) -> str:
+        """TT, TD, DT or DD for the cell of item `row` and item `col`."""
+        return _QUADRANTS[2 * (row >= self._split) + (col >= self._split)]
+
+    def _quadrant_shown(self, row: int, col: int) -> bool:
+        return self._quad_shown[self._quadrant_of(row, col)]
+
+    def _shown_links(self) -> np.ndarray:
+        """Which crosslinks are visible: inside the cutoff and in a quadrant
+        that is switched on. One bool per link."""
+        scores = self._link_scores
+        shown = np.array([self._quad_shown[q] for q in _QUADRANTS])
+        quadrant = 2 * (self._link_rows >= self._split) + (self._link_cols >= self._split)
+        return (scores >= self._cut_lo) & (scores <= self._cut_hi) & shown[quadrant]
+
+    def _on_quadrants_change(self) -> None:
+        self._quad_shown = {name: var.get() for name, var in self._quad_vars.items()}
+        self._group_links()
+        self._reduce_block_scores()
+        self._update_cutoff_label()
+        self._pg_cache.clear()
+        self._schedule()
+        if self._selected is not None:
+            self._select_block(*self._selected)   # update the text for the selected cell
+
     def _on_cutoff(self, lo: float, hi: float) -> None:
         self._cut_lo, self._cut_hi = lo, hi
         self._group_links()
@@ -989,19 +1042,20 @@ class MatrixApp(tk.Tk):
         self._on_cutoff_release(self._min_score, self._max_score)
 
     def _update_cutoff_label(self) -> None:
-        scores = self._score_sorted
-        shown = int(np.searchsorted(scores, self._cut_hi, side="right")
-                    - np.searchsorted(scores, self._cut_lo, side="left"))
+        shown = int(self._shown_links().sum())
         self._cutoff_var.set(f"{self._cut_lo:.4g} – {self._cut_hi:.4g}\n"
-                             f"{shown} of {len(scores)} links shown")
+                             f"{shown} of {len(self._link_scores)} links shown")
 
     # -------------------------------------------------------------------------
     # Zooming out into blocks
     #
     # Below the smallest cell size, zooming out further merges neighbouring
-    # items into blocks. A block never mixes targets with decoys or two
-    # different sections, and its score is the mean, geometric mean or
-    # maximum of the crosslinks inside it.
+    # items into blocks. A block never mixes targets with decoys; small
+    # sections are packed into one block whole, big ones are cut. A block's
+    # value is combined as chosen under
+    # Aggregate. Big matrices get extra zoom steps, so the whole matrix can
+    # always be zoomed out to fit on screen. "Zoom to" picks the zoom that
+    # fits a quadrant (or all shown quadrants) into the view.
     # -------------------------------------------------------------------------
 
     def _on_zoom(self, value: str, anchor: tuple[float, float] | None = None) -> None:
@@ -1016,16 +1070,15 @@ class MatrixApp(tk.Tk):
         item_x = self._item_at(self._mx.canvasx(0) + ax)
         item_y = self._item_at(self._mx.canvasy(0) + ay)
 
-        if v >= CELL_PX_MIN:
-            self._cell_px = v
-            block_size = 1
-            self._zoom_label_var.set(f"{v}px")
-        else:
-            # cells don't get smaller than the minimum; items get merged instead
-            self._cell_px = CELL_PX_MIN
-            steps = CELL_PX_MIN - v
-            block_size = min(BLOCK_SIZE_MAX, max(2, round(BLOCK_ZOOM_GROWTH ** steps)))
-            self._zoom_label_var.set(f"≤{block_size} → {CELL_PX_MIN}px")
+        self._cell_px = max(v, CELL_PX_MIN)   # cells don't get smaller; items get merged instead
+        block_size = self._block_size_for(v)
+        self._zoom_label_var.set(f"{v}px" if block_size == 1 else f"≤{block_size} → {CELL_PX_MIN}px")
+        # hiding or showing the labels moves the matrix on screen; keep the
+        # anchor on the same spot of the screen
+        rx, ry = self._mx.winfo_rootx(), self._mx.winfo_rooty()
+        self._set_overview(block_size > 1)
+        ax += rx - self._mx.winfo_rootx()
+        ay += ry - self._mx.winfo_rooty()
         self._update_cell_font()
         if block_size != self._block_size:
             self._block_size = block_size
@@ -1036,6 +1089,123 @@ class MatrixApp(tk.Tk):
                 self._select_block(*(self._item_to_block[i] for i in self._selected_items))
         self._update_scrollregion()
         self._scroll_to(self._pixel_of(item_x) - ax, self._pixel_of(item_y) - ay)
+
+    def _set_overview(self, on: bool) -> None:
+        """Hide the column headers and row labels while zoomed out into
+        blocks, and show them again when zooming back in."""
+        if on == self._overview:
+            return
+        self._overview = on
+        for widget in (self._corner, self._ch_canvas, self._rl_canvas):
+            if on:
+                widget.grid_remove()
+            else:
+                widget.grid()
+        self.update_idletasks()   # so the matrix canvas has its new size right away
+
+    @staticmethod
+    def _block_size_for(v: int) -> int:
+        """How many items one block holds at zoom slider value v."""
+        if v >= CELL_PX_MIN:
+            return 1
+        return max(2, round(BLOCK_ZOOM_GROWTH ** (CELL_PX_MIN - v)))
+
+    def _blocks_for(self, bs: int) -> list[tuple[int, int]]:
+        """Cut the items into blocks of at most bs items. A block never
+        mixes targets with decoys. A section (e.g. one protein in residue
+        mode) bigger than a block is cut into pieces of bs items; smaller
+        sections are packed together whole, so that matrices with many small
+        sections can still be zoomed out far."""
+        blocks: list[tuple[int, int]] = []
+        cur: tuple[int, int] | None = None   # the block being filled with whole sections
+        for s, e in self._runs:
+            if cur is not None and (s == self._split or e - cur[0] > bs or e - s >= bs):
+                blocks.append(cur)
+                cur = None
+            if e - s >= bs:
+                blocks += [(i, min(i + bs, e)) for i in range(s, e, bs)]
+            else:
+                cur = (cur[0] if cur else s, e)
+        if cur is not None:
+            blocks.append(cur)
+        return blocks
+
+    def _extent_px(self, v: int, start: int, end: int) -> int:
+        """How many pixels the items start:end take up at zoom slider value
+        v. start and end must lie on block borders (0, the target/decoy line
+        or the number of items)."""
+        blocks = sum(1 for s, e in self._blocks_for(self._block_size_for(v)) if start <= s and e <= end)
+        return blocks * max(v, CELL_PX_MIN)
+
+    def _find_runs(self) -> list[tuple[int, int]]:
+        """The sections in axis order, also cut at the target/decoy line.
+        Blocks are built from these (see _blocks_for)."""
+        items, section, split = self._proteins, self._section, self._split
+        runs, start = [], 0
+        for j in range(1, len(items) + 1):
+            if (j == len(items) or j == split
+                    or (section is not None
+                        and section.get(items[j], "") != section.get(items[start], ""))):
+                runs.append((start, j))
+                start = j
+        return runs
+
+    def _find_zoom_min(self) -> int:
+        """The lowest zoom slider value: at least BLOCK_ZOOM_STEPS below
+        CELL_PX_MIN, and further for big matrices, until the whole matrix
+        fits into ZOOM_OUT_FIT_PX or blocks can't get any bigger (one block
+        for the targets and one for the decoys)."""
+        n = len(self._proteins)
+        longest = max(self._split, n - self._split, 1)
+        v = CELL_PX_MIN - BLOCK_ZOOM_STEPS
+        while self._extent_px(v, 0, n) > ZOOM_OUT_FIT_PX and self._block_size_for(v) < longest:
+            v -= 1
+        return v
+
+    def _zoom_region(self, target: str) -> tuple[int, int, int, int] | None:
+        """The items (row start, row end, column start, column end) that
+        `target` covers: one quadrant, or for "All" the box around all
+        quadrants that are switched on. None if it holds no items."""
+        n, split = len(self._proteins), self._split
+        sides = {"T": (0, split), "D": (split, n)}
+        names = [target] if target != "All" else [q for q in _QUADRANTS if self._quad_shown[q]]
+        boxes = [(*sides[q[0]], *sides[q[1]]) for q in names]
+        boxes = [b for b in boxes if b[0] < b[1] and b[2] < b[3]]
+        if not boxes:
+            return (0, n, 0, n) if target == "All" and n else None
+        return (min(b[0] for b in boxes), max(b[1] for b in boxes),
+                min(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    def _zoom_to(self, target: str) -> None:
+        """Zoom so that the region fills the view as far as possible, and
+        center it. A hidden quadrant is switched on first."""
+        region = self._zoom_region(target)
+        if region is None:
+            return
+        if target != "All" and not self._quad_shown[target]:
+            self._quad_vars[target].set(True)   # the trace redraws with it shown
+        r0, r1, c0, c1 = region
+        # the whole area, with the labels if they are shown right now
+        full_w, full_h = self._mx.winfo_width(), self._mx.winfo_height()
+        if not self._overview:
+            full_w, full_h = full_w + self._label_w, full_h + self._header_h
+        # with cells the labels take their space; zoomed out into blocks they
+        # are hidden and only the padding around the matrix is left free
+        with_labels = (full_w - self._label_w, full_h - self._header_h)
+        overview = (full_w - 2 * OVERVIEW_PAD_PX, full_h - 2 * OVERVIEW_PAD_PX)
+
+        def fits(v: int) -> bool:
+            fw, fh = with_labels if v >= CELL_PX_MIN else overview
+            return self._extent_px(v, c0, c1) <= fw and self._extent_px(v, r0, r1) <= fh
+
+        # the biggest zoom at which the region still fits
+        v = next((v for v in range(CELL_PX_MAX, self._zoom_min - 1, -1) if fits(v)), self._zoom_min)
+        self._on_zoom(str(v))
+        self._zoom.set(v)
+        w, h = self._mx.winfo_width(), self._mx.winfo_height()
+        x0, x1 = self._pixel_of(c0), self._pixel_of(c1)
+        y0, y1 = self._pixel_of(r0), self._pixel_of(r1)
+        self._scroll_to(x0 - (w - (x1 - x0)) / 2, y0 - (h - (y1 - y0)) / 2)
 
     def _item_at(self, pixel: float) -> float:
         """Which item lies at this pixel of the whole matrix. The answer has
@@ -1064,24 +1234,8 @@ class MatrixApp(tk.Tk):
         self._schedule()
 
     def _recompute_blocks(self) -> None:
-        items, section, split, bs = self._proteins, self._section, self._split, self._block_size
-        n = len(items)
-        has_sep = 0 < split < n
-
-        def same_block(i: int, j: int) -> bool:
-            if has_sep and j == split:
-                return False
-            return section is None or section.get(items[j], "") == section.get(items[i], "")
-
-        blocks = []
-        i = 0
-        while i < n:
-            j = i + 1
-            if bs > 1:
-                while j < min(n, i + bs) and same_block(i, j):
-                    j += 1
-            blocks.append((i, j))
-            i = j
+        n, split, bs = len(self._proteins), self._split, self._block_size
+        blocks = self._blocks_for(bs)
 
         self._blocks = blocks
         self._item_to_block = [bi for bi, (s, e) in enumerate(blocks) for _ in range(s, e)]
@@ -1091,10 +1245,12 @@ class MatrixApp(tk.Tk):
 
     def _group_links(self) -> None:
         """Sort every visible crosslink into its cell (row block of Protein1,
-        column block of Protein2). Hidden scores are left out, so the block
-        values only describe what you can see."""
+        column block of Protein2). Links hidden by the cutoff or by a
+        quadrant checkbox are left out, so the block values only describe
+        what you can see. A block never crosses the target/decoy line, so
+        each cell lies in one quadrant."""
         scores = self._link_scores
-        keep = (scores >= self._cut_lo) & (scores <= self._cut_hi)
+        keep = self._shown_links()
         to_block = np.array(self._item_to_block, dtype=np.int64)
         n = max(1, len(self._blocks))
         cell = to_block[self._link_rows[keep]] * n + to_block[self._link_cols[keep]]
@@ -1115,8 +1271,10 @@ class MatrixApp(tk.Tk):
         else:
             values = scores   # one item per block, so a cell holds exactly one crosslink
         self._cell_scores = np.array(values, dtype=float)
-        if self._block_size > 1 and self._agg_method == "count":
-            # counts aren't scores, so they are coloured by their rank among the counts
+        if self._block_size > 1 and self._agg_method in ("count", "rss"):
+            # counts aren't scores, and a root sum of squares grows with the
+            # number of crosslinks past every single score, so both are
+            # coloured by their rank among the values on screen
             self._colour_ref = np.sort(self._cell_scores)
         else:
             self._colour_ref = self._score_sorted
@@ -1228,8 +1386,15 @@ class MatrixApp(tk.Tk):
             score = self._sparse.get((self._proteins[r_lo], self._proteins[c_lo]))
             if score is None:
                 return "(no crosslink)"
-            hidden = "" if self._in_cutoff(score) else " (hidden by cutoff)"
+            if not self._quadrant_shown(r_lo, c_lo):
+                hidden = f" (hidden: {self._quadrant_of(r_lo, c_lo)} quadrant)"
+            elif not self._in_cutoff(score):
+                hidden = " (hidden by cutoff)"
+            else:
+                hidden = ""
             return f"score: {score:.4f}{hidden}"
+        if not self._quadrant_shown(r_lo, c_lo):
+            return f"(hidden: {self._quadrant_of(r_lo, c_lo)} quadrant)"
         cell = self._cell_at(rb, cb)
         if cell is None:
             return "(no crosslinks)"
@@ -1269,8 +1434,9 @@ class MatrixApp(tk.Tk):
         if not self._proteins:
             return
         try:
-            self._draw_col_headers()
-            self._draw_row_labels()
+            if not self._overview:   # the labels are hidden while zoomed out into blocks
+                self._draw_col_headers()
+                self._draw_row_labels()
             self._draw_matrix()
         except Exception as exc:
             self._report_render_error(exc)
@@ -1337,6 +1503,13 @@ class MatrixApp(tk.Tk):
             sel = (self._selected[1] * cp - ox, self._selected[0] * cp - oy)
         return sx, sy, sel
 
+    def _matrix_box(self) -> tuple[int, int, int, int]:
+        """Where the whole matrix lies in the view: left, top, right, bottom.
+        Zoomed out it can be smaller than the view."""
+        size = len(self._blocks) * self._cell_px
+        ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
+        return -ox, -oy, size - ox, size - oy
+
     def _draw_matrix_pygame(self) -> None:
         """Draw the visible matrix into the off-screen picture, then show it."""
         self._pg_sync_size()
@@ -1356,10 +1529,13 @@ class MatrixApp(tk.Tk):
             screen.blit(surf, (x, y))
 
         sx, sy, sel = self._overlay_positions()
+        bx0, by0, bx1, by1 = self._matrix_box()
         if sx is not None:
-            _pygame.draw.line(screen, _SEP, (sx, 0), (sx, h))
+            _pygame.draw.line(screen, _SEP, (sx, max(0, by0)), (sx, min(h, by1)))
             if 0 <= sy <= h:
-                _pygame.draw.line(screen, _SEP, (0, sy), (w, sy))
+                _pygame.draw.line(screen, _SEP, (max(0, bx0), sy), (min(w, bx1), sy))
+        if self._overview:
+            _pygame.draw.rect(screen, _SEP, (bx0 - 1, by0 - 1, bx1 - bx0 + 2, by1 - by0 + 2), 1)
         if sel is not None:
             _pygame.draw.rect(screen, _HL, (*sel, cp, cp), max(2, cp // 8))
 
@@ -1376,10 +1552,13 @@ class MatrixApp(tk.Tk):
             img.paste(_auto_fg(colour), (x + cp // 2 - mx, y + cp // 2 - my), mask)
 
         sx, sy, sel = self._overlay_positions()
+        bx0, by0, bx1, by1 = self._matrix_box()
         if sx is not None:
-            draw.line([(sx, 0), (sx, h)], fill=_SEP, width=1)
+            draw.line([(sx, max(0, by0)), (sx, min(h, by1))], fill=_SEP, width=1)
             if 0 <= sy <= h:
-                draw.line([(0, sy), (w, sy)], fill=_SEP, width=1)
+                draw.line([(max(0, bx0), sy), (min(w, bx1), sy)], fill=_SEP, width=1)
+        if self._overview:
+            draw.rectangle([bx0 - 1, by0 - 1, bx1, by1], outline=_SEP, width=1)
         if sel is not None:
             hx, hy = sel
             draw.rectangle([hx, hy, hx + cp - 1, hy + cp - 1], outline=_HL, width=max(2, cp // 8))
@@ -1587,7 +1766,7 @@ class MatrixApp(tk.Tk):
         for ri, pi in enumerate(items):
             for ci, pj in enumerate(items):
                 score = self._sparse.get((pi, pj))
-                if score is None or not self._in_cutoff(score):
+                if score is None or not self._in_cutoff(score) or not self._quadrant_shown(ri, ci):
                     continue
                 colour = self._cell_colour(score)
                 x0, y0 = lw + ci * cp, hh + ri * cp
