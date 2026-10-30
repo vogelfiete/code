@@ -23,7 +23,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fetch_group_order import order_by_kegg, order_by_string, short_accession
+from fetch_group_order import order_by_go_complex, order_by_kegg, short_accession
 from xlms.io import read_fasta
 
 
@@ -397,7 +397,7 @@ def _order_pathway(group, sequences, species):
 
 
 def _order_complex(group, sequences, species):
-    return order_by_string(group, species)
+    return order_by_go_complex(group, species)
 
 
 _ORDERINGS = {
@@ -598,22 +598,17 @@ def main() -> None:
                         help=f"Number of unique proteins/residues (default {DEFAULT_N})")
     parser.add_argument("--order", choices=ORDER_MODES, default="confidence",
                         help="Axis ordering: confidence (default), alpha, "
-                             "sequence, pathway (KEGG), complex (STRING), "
+                             "sequence, pathway (KEGG), complex (GO cellular component), "
                              "size (longest sequence first)")
     parser.add_argument("--fasta", default=None,
-                        help="FASTA file path (required for --order sequence "
-                             "and --include-unlinked)")
+                        help="FASTA file path (required for --order sequence; in residue "
+                             "mode it also adds the residues without crosslinks)")
     parser.add_argument("--species", type=int, default=9606,
                         help="NCBI taxonomy ID for external DB queries (default 9606 = human)")
-    parser.add_argument("--include-unlinked", action="store_true",
-                        help="Also show residues with no crosslinks, not just linked "
-                             "ones (residue mode only, requires --fasta)")
     args = parser.parse_args()
 
     if args.order == "sequence" and not args.fasta:
         parser.error("--fasta is required when --order sequence")
-    if args.include_unlinked and not args.fasta:
-        parser.error("--fasta is required when --include-unlinked")
 
     residue_level = args.level == "residue"
     tracemalloc.start()
@@ -625,8 +620,10 @@ def main() -> None:
 
     sequences = read_fasta(args.fasta) if args.fasta else None
     if residue_level:
-        if args.include_unlinked:
-            items, is_decoy = add_unlinked_residues(items, is_decoy, sequences or {})
+        if sequences:
+            # with a FASTA, every residue of the loaded proteins is shown,
+            # not only the crosslinked ones
+            items, is_decoy = add_unlinked_residues(items, is_decoy, sequences)
         items, sections = sort_residues(items, is_decoy, args.order, sequences, args.species)
         labels = dict(
             col_label_fn=lambda r: _truncate(str(r.pos), COL_W),

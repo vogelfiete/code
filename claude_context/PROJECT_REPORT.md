@@ -17,7 +17,7 @@
 - **The matrix is DIRECTIONAL (user requirement):** cell (row A, col B) = best score of CSV rows
   with `Protein1=A, Protein2=B`; rows `B,A` go to (row B, col A). A–B and B–A are never merged.
 - **Core thesis idea:** *axis ordering* so structure becomes visible — confidence, alphabet,
-  sequence k-mer similarity, KEGG pathway, STRING complex, size. Targets always before decoys.
+  sequence k-mer similarity, KEGG pathway, GO complex (STRING replaced 2026-10-20), size. Targets always before decoys.
   (`cluster` by score was **removed** on user request, "for now" — may come back; it would need a
   symmetric distance, e.g. max/mean of both directions — ask the user.)
 - **User decisions to respect:** no FDR filtering (intentional); keep the two CSV readers as they are
@@ -82,10 +82,10 @@ CSV ──► build_matrix / build_residue_matrix  (thin wrappers) ──► _bu
         ├─ pass 1: collect N unique items (skip ambiguous ';' names; count rows w/o positions → warning)
         ├─ _classify_proteins → {protein: is_decoy};  items = targets first, decoys second (stable)
         └─ pass 2: sparse {(item_from_Protein1, item_from_Protein2): best_score}   ← DIRECTIONAL
-     ──► [residue + include-unlinked] add_unlinked_residues(FASTA)
+     ──► [residue + FASTA given] add_unlinked_residues(FASTA)
      ──► sort_proteins / sort_residues(items, is_decoy, mode, sequences, species)
           └─ _apply_order per target group and decoy group → _ORDERINGS[mode](group, sequences, species)
-               pathway/complex → fetch_group_order.order_by_kegg / order_by_string (HTTP + disk cache)
+               pathway/complex → fetch_group_order.order_by_kegg / order_by_go_complex (HTTP + disk cache)
      ──► CLI: print_matrix() to stdout      GUI: MatrixApp._on_loaded() → blocks → render
 ```
 
@@ -137,16 +137,22 @@ ordering / console rendering / CLI.
 | `_order_*` (315–366), `_ORDERINGS` (370), `ORDER_MODES` (377) | ordering functions + registry |
 | `sort_proteins` (387) / `sort_residues` (403) | targets/decoys ordered separately; residue sections = protein |
 | `print_matrix` (469) | console render (vertical col labels, dots, scale legend, name legend) |
-| `main` (552) | argparse `csv --level --n --order --fasta --species --include-unlinked` |
+| `main` (552) | argparse `csv --level --n --order --fasta --species`; residue mode + FASTA always adds unlinked residues (`--include-unlinked` removed 2026-10-19) |
 
 ### 4.4 `scripts/fetch_group_order.py`
 - `short_accession` (22): `sp|P12345|X desc` → `P12345`; else first token. Single shared definition.
-- Cache `~/.cache/xlms_matrix/<folder>/*.json` (exists locally: `hsa_kegg/` full, `1423_string/` empty).
+- Cache `~/.cache/xlms_matrix/<folder>/*.json` (exists locally: `hsa_kegg/` full, `go/`, old unused `1423_string/`).
 - KEGG: `_ncbi_to_kegg_code` (hardcoded 8 species else KEGG lookup), `_cached_kegg_table` (136) =
   generic download-TSV-parse-cache; builders `_uniprot_to_gene`, `_gene_to_pathways`, `_pathway_names`.
   `order_by_kegg` (175).
-- STRING: `_string_resolve_ids`, `_string_fetch_enrichment`, `order_by_string` (236); categories
-  `CORUM, PPI_hub_proteins, KEGG_Pathways`; gene matching `sid.endswith(gene) or gene in sid`.
+- GO complexes (user request 2026-10-20, replaced STRING + `_post`): `order_by_go_complex(proteins, species)`
+  (species ignored). `_uniprot_cellular_component` = UniProt `uniprotkb/accessions?fields=go_c&format=tsv`
+  in batches of 100 (300 per request tested, no paging), parsed `name [GO:id]` → cache
+  `go/uniprot_cellular_component.json` {acc: [[go, name]]}, unknown acc → []. `_go_complex_terms` = QuickGO
+  descendants of GO:0032991 via `is_a` (2085 terms) → `go/complex_terms.json`; the root itself is excluded.
+  `_UNIPROT_ACCESSION` regex filters non-accessions (decoys) before the request (UniProt rejects the whole
+  batch otherwise); isoform suffix `-2` stripped. Checked: 2SDA ppi → ribosomal subunits, ATP synthase,
+  ACC complex; SCE → proteasome, ribosome, CCT; most proteins stay "Unknown" (not in a complex).
 - Shared: `_assign_primary_groups` (top 10 terms, first match, else "Unknown"), `_group_and_sort`
   (largest section first, Unknown last), `_order_by_memberships`.
 
@@ -158,7 +164,7 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
 `MatrixApp(tk.Tk)`, sectioned with comment banners (use grep for line numbers):
 - **UI construction:** `_build_sidebar()` = fixed-width (`SIDEBAR_W=270`) **left panel**, vertically
   scrollable via `_scrollable()` (global `<MouseWheel>` binding that only acts when the pointer is over
-  the panel). Groups: **Data** (CSV/FASTA, Level, only-linked, N, Order, Species, Load, Export, status),
+  the panel). Groups: **Data** (CSV/FASTA, Level, Order, Species, Load, Export, status),
   **Display** (Colormap, Zoom, Aggregate), **Quadrants** (TT/TD/DT/DD checkboxes, 2026-10-14), **Score cutoff** (RangeSlider, label, Reset),
   **Selection** (wrapped info text); footer = item count + renderer. No top bar / status bar any more
   (added 2026-09-30 on user request: bigger matrix area). Matrix grid packs to the right of it.
@@ -177,9 +183,10 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
 - **No "Show only linked residues" checkbox** (user request 2026-10-18): removed with `_only_linked_var` and
   `_on_level_change`. Residue mode adds unlinked residues whenever a FASTA is given (`if seqs:` in the load worker),
   otherwise linked only. Data rows now: CSV 0, FASTA 1, Level 2, Order 3, Species 4, buttons 5, status 6.
+  The CLI does the same since 2026-10-19 (`--include-unlinked` flag removed on user request).
 - **No N in the GUI** (user request 2026-10-18): the N spinbox is gone; the GUI calls `build_matrix`/
   `build_residue_matrix` with `n=None` = all items (`_build` only stops early when n is not None). The CLI keeps
-  `--n` (default `DEFAULT_N`=1000). Data group rows: CSV 0, FASTA 1, Level 2, only-linked 3, Order 4, Species 5.
+  `--n` (default `DEFAULT_N`=1000).
 - **Zoom to + deeper zoom-out** (user request 2026-10-14): `BLOCK_SIZE_MAX` removed. `_runs` (from `_find_runs`,
   per load) = stretches that may share a block (same section, same side of split); `_recompute_blocks` chunks runs
   (identical to the old greedy loop, verified). `_zoom_min` (from `_find_zoom_min`) lowers the slider's `from_`
@@ -229,7 +236,23 @@ dragging, `release_command` on release; handles can't cross; ends map exactly to
   `_label_image(text, vertical)` masks instead of `draw.text` per character. `_overlay_positions` for
   separator + highlight; `_section_runs` shared by header + export.
 - **Export** (990): `_render_full_image` — full matrix, one cell per item (no aggregation),
-  `cp = min(cell_px, 16)` → never shows score text.
+  `cp = min(cell_px, 16)` → never shows score text. Since 2026-10-20 it loops over `_shown_links()` instead of
+  n² `sparse.get` (same cells), and the image is `_slant_w` wider for the slanted names of the last columns.
+- **45° column labels** (user request 2026-10-20): `_slanted_label(text)` → (L image rotated by `LABEL_ANGLE`,
+  x, y of the text start) cached in `_slant_cache`; pasted with the start under the column centre,
+  `LABEL_GAP_PX` above the header line. `_measure_col_labels` (on load; widest label by PIL `getlength`) sets
+  `_slant_h`/`_slant_w`; `_label_base` = section row + `_slant_h` = y of the header line; `_header_h` =
+  `_label_base + lh//2 + 2`. Columns left of the view are drawn too (`reach`), their names reach into it.
+  `_label_image(text)` is now row labels only (vertical mode removed). Export uses the same helpers.
+- **Fold to triangle** (user request 2026-10-20): toggle `Checkbutton(indicatoron=False)` in Display row 6 →
+  `_on_fold_change`. `_folded` makes `_group_links` map blocks to `(max, min)` (lower triangle; TD joins DT),
+  `_reduce_block_scores` aggregates whenever `combined = block_size > 1 or folded` (so a single folded
+  cell = Aggregate of both directions; count/rss colour by rank). Quadrant/cutoff filters apply before folding.
+  `_select_at` mirrors clicks in the empty half; `_folded_score_line` lists both directions + combined value.
+  `_cell_colour(score, ref=None)` got an optional sorted reference (screen text cells pass `_colour_ref`,
+  folded count/rss export passes its own values). Verified on SCE Links: 10622 → 10208 cells (414 pairs in
+  both directions), no cell above the diagonal, values of all four methods checked by hand.
+  `_on_agg_method_change` now also refreshes the selection text.
 
 ### 4.6 `tests/matrix.py`
 `venv/Scripts/python.exe Bachelorarbeit/tests/matrix.py` → 4 tests pass. Covers only `xlms.io`.
@@ -245,7 +268,7 @@ No tests for print_matrix / GUI (regression harnesses were used ad hoc — see �
 | `alpha` | `sorted()` | – | no |
 | `sequence` | 3-mer frequency vectors, cosine distance, average linkage; missing seqs appended | FASTA | no |
 | `pathway` | KEGG | network/cache, `--species` | **yes** |
-| `complex` | STRING enrichment | network/cache, `--species` | **yes** |
+| `complex` | GO cellular component ⊂ protein-containing complex (UniProt + QuickGO) | network/cache, UniProt accessions | **yes** |
 | `size` | longest sequence first; unknown length last | FASTA (else no-op) | no |
 | ~~`cluster`~~ | removed 2026-09-30 (user: "for now") | | |
 
@@ -292,7 +315,7 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 ## 8. Gotchas & known limitations (check before "fixing")
 
 1. **FASTA key mismatch:** `read_fasta` keys = full header token (`sp|P12763|FETUA_BOVIN`), xiFDR
-   uses bare `P12763` → `sequence`, `size`, `--include-unlinked`, GUI "aa" silently find nothing.
+   uses bare `P12763` → `sequence`, `size`, unlinked residues (CLI and GUI), GUI "aa" silently find nothing.
 2. **KEGG section labels never get names:** `pathway_names.json` keys are `hsa01100`, memberships use
    `path:hsa01100` → labels show raw ids. Pre-existing; told user, not fixed yet.
 3. `pyrightconfig.json` points to `../.venv`; actual venv is `code/venv`.
@@ -301,7 +324,7 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 6. ppi-level files and `example_500.csv` give triangular matrices (each pair listed once) — expected.
 7. (FIXED 2026-09-30) pygame idle loop used to rebuild the frame every 16 ms (34–72 % main thread busy while idle) and swallow errors; now idle cost ≈ 0 redraws, errors reported.
 8. Export ignores block aggregation, never shows score text; very large N → huge PNG.
-9. STRING gene matching is substring-based → possible false memberships.
+9. (GONE 2026-10-20) STRING gene matching was substring-based; STRING is no longer used.
 10. Residue-mode CLI section headers render as `==` for proteins with 1–2 residues (by design).
 11. `print_matrix.py` rewraps `sys.stdout` at import time (also when the GUI imports it).
 13. (FIXED 2026-10-10, see Selection in §4.5) **Stale selection (reproduced 2026-09-30):** `_selected` (block indices) is not cleared on

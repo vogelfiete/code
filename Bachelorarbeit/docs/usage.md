@@ -85,9 +85,8 @@ python scripts/print_matrix.py <csv_path> [options]
 | `--level {protein,residue}` | axis granularity (default `protein`) |
 | `--n INT` | number of unique proteins/residues to display (default 1000) |
 | `--order MODE` | axis ordering, see below (default `confidence`) |
-| `--fasta PATH` | FASTA file, required for `--order sequence` and `--include-unlinked` |
-| `--species INT` | NCBI taxonomy ID for pathway/complex lookups (default 9606, human) |
-| `--include-unlinked` | residue mode: also show residues with no crosslinks, not just linked ones (needs `--fasta`) |
+| `--fasta PATH` | FASTA file, required for `--order sequence`; in residue mode it also adds the residues without crosslinks |
+| `--species INT` | NCBI taxonomy ID for KEGG pathway lookups (default 9606, human) |
 
 `--order` modes:
 
@@ -95,7 +94,9 @@ python scripts/print_matrix.py <csv_path> [options]
 - `alpha` — alphabetical
 - `sequence` — hierarchical clustering by k-mer similarity (needs `--fasta`)
 - `pathway` — grouped by KEGG pathway (needs `--species`)
-- `complex` — grouped by STRING complex/pathway (needs `--species`)
+- `complex` — grouped by protein complex, taken from the Gene Ontology
+  "cellular component" terms in UniProt (only terms that are a kind of
+  *protein-containing complex*, GO:0032991); needs UniProt accessions, not `--species`
 - `size` — longest sequence first (needs `--fasta` for real lengths)
 
 In `--level residue` mode, every `--order` mode above is applied to each
@@ -131,11 +132,11 @@ header block that can't fit its name (renders as `==`) — this is a limit of
 the fixed 2-char cell width shared with protein mode, not a bug; the row
 label and legend still identify the protein.
 
-By default only residues that are an actual crosslink endpoint in the CSV
-are shown (`--n` selects the top-N most confident of these). Pass
-`--include-unlinked` (with `--fasta`) to also add every other residue
-position of each protein that already has at least one linked residue, so
-the matrix shows the linked residues' position within the full sequence.
+`--n` selects the top-N most confident residues that are an actual
+crosslink endpoint in the CSV. With `--fasta`, every other residue
+position of each protein that already has at least one linked residue is
+added too, so the matrix shows the linked residues' position within the
+full sequence. Without a FASTA only the crosslinked residues are shown.
 This can add a lot of columns for long proteins — the `--n` cutoff still
 limits how many *linked* residues (and therefore which proteins) are pulled
 in, it just doesn't cap the unlinked expansion within those proteins.
@@ -183,7 +184,7 @@ there is no `--n`: the GUI always loads all proteins or residues of the CSV
 - **Level** — `protein` (default) or `residue`; switches the axis unit.
   Requires the CSV to have residue-position columns (see above). In residue
   mode with a FASTA file, every residue of the loaded proteins is shown,
-  also those without crosslinks (like `--include-unlinked`); without a
+  also those without crosslinks (same as the CLI); without a
   FASTA only the crosslinked residues are shown.
 - **Export PNG…** — renders the full (unscrolled, un-aggregated) matrix to a
   PNG file, with the score cutoff applied.
@@ -216,6 +217,16 @@ there is no `--n`: the GUI always loads all proteins or residues of the CSV
   crosslinks), or the count of crosslinks in it. Root sums of squares and
   counts get their own colour scale, by their rank among all values on
   screen.
+- **Fold to triangle** — a toggle button that folds the matrix along its
+  diagonal: the crosslinks A→B and B→A of a pair end up together in one
+  cell below the diagonal, combined with the **Aggregate** method (also for
+  single cells, e.g. the geometric mean of both directions), and the upper
+  half stays empty. TD links fold into the DT quadrant. Clicking the empty
+  half selects the mirror cell; the selection shows both directions and the
+  combined value. **Export PNG…** exports the folded matrix too.
+
+Column names in the header are written at 45°, going up to the right from
+the middle of their column.
 
 **Quadrants** — four checkboxes, laid out like the matrix: **TT**
 (target row, target column), **TD** (target row, decoy column), **DT** and
@@ -258,13 +269,20 @@ and exposes two functions:
 
 ```python
 order_by_kegg(proteins: list[str], species: int) -> tuple[list[str], dict[str, str]]
-order_by_string(proteins: list[str], species: int) -> tuple[list[str], dict[str, str]]
+order_by_go_complex(proteins: list[str], species: int) -> tuple[list[str], dict[str, str]]
 ```
 
 Both return the reordered protein list plus a `{protein: section_label}`
 dict used for the section headers. Results are cached on disk under
-`~/.cache/xlms_matrix/` so repeated lookups for the same species don't hit
-KEGG/STRING again.
+`~/.cache/xlms_matrix/` so repeated lookups don't hit KEGG, UniProt or
+QuickGO again. `order_by_go_complex` asks UniProt for the GO cellular
+component terms of each accession (cached per protein in
+`go/uniprot_cellular_component.json`) and keeps only the terms below
+"protein-containing complex", which it gets from QuickGO once
+(`go/complex_terms.json`). Isoform accessions (`P12345-2`) use the
+annotation of the main entry; names that aren't UniProt accessions (e.g.
+`decoy:P01267`) end up in "Unknown". Delete the cache files to fetch
+fresh annotations.
 
 ## `xlms` package (`src/xlms`)
 

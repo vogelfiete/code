@@ -1,17 +1,17 @@
 """Group proteins by biology for the "pathway" and "complex" orderings.
 
-KEGG tells us which pathways a protein is part of, STRING which complexes.
-Proteins that share a pathway or complex are put next to each other, and each
-protein gets the name of its group as a section label for the matrix headers.
-print_matrix.py uses this through order_by_kegg() and order_by_string().
+KEGG tells us which pathways a protein is part of, Gene Ontology (through
+UniProt) which complexes. Proteins that share a pathway or complex are put
+next to each other, and each protein gets the name of its group as a section
+label for the matrix headers. print_matrix.py uses this through
+order_by_kegg() and order_by_go_complex().
 
 Everything downloaded is cached as JSON under ~/.cache/xlms_matrix/, so each
 lookup only hits the internet once."""
 from __future__ import annotations
 
 import json
-import time
-import urllib.parse
+import re
 import urllib.request
 import warnings
 from collections import Counter, defaultdict
@@ -71,17 +71,10 @@ def _get(url: str) -> str:
         return resp.read().decode("utf-8")
 
 
-def _post(url: str, data: dict) -> list:
-    encoded = urllib.parse.urlencode(data).encode("utf-8")
-    req = urllib.request.Request(url, data=encoded, headers=_USER_AGENT)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 # -----------------------------------------------------------------------------
 # Grouping proteins into named sections
 #
-# Used by both KEGG and STRING: once we know which terms (pathways or
+# Used by both KEGG and GO: once we know which terms (pathways or
 # complexes) each protein belongs to, every protein is put into exactly one
 # section, and the sections are sorted from largest to smallest.
 # -----------------------------------------------------------------------------
@@ -217,86 +210,79 @@ def order_by_kegg(proteins: list[str], species: int = 9606) -> tuple[list[str], 
 
 
 # -----------------------------------------------------------------------------
-# STRING complexes
+# Complexes from Gene Ontology
 #
-# STRING first translates our identifiers into its own IDs, then an
-# enrichment query tells us which complexes and pathways they belong to.
-# Results are cached per protein, so later runs only ask about new ones.
+# UniProt lists the GO "cellular component" terms of every protein. Only the
+# terms that are a kind of "protein-containing complex" (GO:0032991) count as
+# complexes; QuickGO tells us which terms those are. Both are cached, the
+# UniProt answers per protein, so later runs only ask about new ones.
 # -----------------------------------------------------------------------------
 
-_STRING_BASE = "https://string-db.org/api/json"
-_STRING_COMPLEX_CATEGORIES = {"CORUM", "PPI_hub_proteins", "KEGG_Pathways"}
+_GO_COMPLEX_ROOT = "GO:0032991"   # protein-containing complex
+_UNIPROT_BATCH = 100              # accessions per UniProt request
+# what a UniProt accession looks like (from the UniProt documentation)
+_UNIPROT_ACCESSION = re.compile(
+    r"[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2}")
 
 
-def _string_resolve_ids(identifiers: list[str], taxid: int) -> dict[str, str]:
-    """Map our identifiers to STRING IDs: {input name: STRING id}."""
-    try:
-        results = _post(f"{_STRING_BASE}/get_string_ids", {
-            "identifiers": "\r".join(identifiers),
-            "species": taxid,
-            "limit": 1,
-            "echo_query": 1,
-            "caller_identity": "xlms_matrix",
-        })
-        return {r["queryItem"]: r["stringId"] for r in results if "stringId" in r}
-    except Exception as e:
-        warnings.warn(f"STRING: ID resolution failed — {e}")
-        return {}
+def _go_complex_terms() -> set[str]:
+    """All GO terms that are a kind of protein-containing complex (about 2000)."""
+    cache_file = _cache_path("go", "complex_terms.json")
+    cached = _load_cache(cache_file)
+    if cached is None:
+        print("[GO] Downloading the list of complex terms (one-time, will be cached)…")
+        url = (f"https://www.ebi.ac.uk/QuickGO/services/ontology/go/terms/"
+               f"{_GO_COMPLEX_ROOT}/descendants?relations=is_a")
+        data = json.loads(_get(url))
+        cached = {"terms": data["results"][0].get("descendants", [])}
+        _save_cache(cache_file, cached)
+    return set(cached["terms"])
 
 
-def _string_fetch_enrichment(string_ids: list[str], taxid: int) -> list[dict]:
-    """The enrichment records STRING finds for these proteins."""
-    try:
-        return _post(f"{_STRING_BASE}/enrichment", {
-            "identifiers": "\r".join(string_ids),
-            "species": taxid,
-            "caller_identity": "xlms_matrix",
-        })
-    except Exception as e:
-        warnings.warn(f"STRING: enrichment fetch failed — {e}")
-        return []
+def _uniprot_cellular_components(accessions: list[str]) -> dict[str, list[list[str]]]:
+    """The GO cellular component terms of each accession, as
+    {accession: [[GO id, name], ...]}. Accessions UniProt doesn't know get
+    an empty list."""
+    result: dict[str, list[list[str]]] = {acc: [] for acc in accessions}
+    for k in range(0, len(accessions), _UNIPROT_BATCH):
+        batch = accessions[k:k + _UNIPROT_BATCH]
+        url = ("https://rest.uniprot.org/uniprotkb/accessions?accessions="
+               + ",".join(batch) + "&fields=accession,go_c&format=tsv")
+        # each line: accession, then "name [GO:id]; name [GO:id]; ..."
+        for line in _get(url).splitlines()[1:]:
+            acc, _, terms = line.partition("\t")
+            result[acc] = [[m.group(2), m.group(1)]
+                           for m in re.finditer(r"\s*([^;]+?) \[(GO:\d+)\]", terms)]
+    return result
 
 
-def order_by_string(proteins: list[str], species: int = 9606) -> tuple[list[str], dict[str, str]]:
-    """Put proteins that share STRING complexes or pathways next to each other.
-    Only proteins that aren't cached yet are sent to STRING (two requests).
+def order_by_go_complex(proteins: list[str], species: int = 9606) -> tuple[list[str], dict[str, str]]:
+    """Put proteins that share a GO complex next to each other. The species
+    isn't needed, a UniProt accession already belongs to one species.
     Returns (ordered proteins, {protein: section name})."""
-    cache_file = _cache_path(f"{species}_string", "complexes.json")
-    names_cache_file = _cache_path(f"{species}_string", "term_names.json")
-    cache: dict[str, list[str]] = _load_cache(cache_file) or {}      # bare id -> terms
-    term_names: dict[str, str] = _load_cache(names_cache_file) or {}
+    cache_file = _cache_path("go", "uniprot_cellular_component.json")
+    cache: dict[str, list[list[str]]] = _load_cache(cache_file) or {}
 
-    bare = {p: short_accession(p) for p in proteins}
-    to_resolve = [p for p in proteins if bare[p] not in cache]
+    # "P12345-2" is an isoform of P12345, which carries the annotation
+    bare = {p: short_accession(p).split("-")[0] for p in proteins}
+    no_accession = [p for p in proteins if not _UNIPROT_ACCESSION.fullmatch(bare[p])]
+    to_fetch = sorted({bare[p] for p in proteins if p not in no_accession and bare[p] not in cache})
+    if no_accession:
+        warnings.warn(f"GO: {len(no_accession)} protein(s) without a UniProt accession — appended at end")
 
-    if to_resolve:
-        string_ids = _string_resolve_ids([bare[p] for p in to_resolve], species)
-        time.sleep(1)
+    if to_fetch:
+        print(f"[GO] Asking UniProt about {len(to_fetch)} protein(s)…")
+        try:
+            cache.update(_uniprot_cellular_components(to_fetch))
+            _save_cache(cache_file, cache)
+        except Exception as e:
+            warnings.warn(f"GO: UniProt request failed — {e}")
 
-        if string_ids:
-            enrichment = _string_fetch_enrichment(list(string_ids.values()), species)
-            time.sleep(1)
-
-            terms_of: dict[str, set[str]] = {sid: set() for sid in string_ids.values()}
-            for record in enrichment:
-                if record.get("category") not in _STRING_COMPLEX_CATEGORIES:
-                    continue
-                term = record["term"]
-                term_names[term] = record.get("description") or term
-                for gene in record.get("inputGenes", "").split(","):
-                    gene = gene.strip()
-                    for sid in string_ids.values():
-                        if sid.endswith(gene) or gene in sid:
-                            terms_of[sid].add(term)
-
-            for protein in to_resolve:
-                sid = string_ids.get(bare[protein])
-                cache[bare[protein]] = [] if sid is None else sorted(terms_of.get(sid, set()))
-                if sid is None:
-                    warnings.warn(f"STRING: no entry found for '{protein}' — appended at end")
-
-        _save_cache(cache_file, cache)
-        _save_cache(names_cache_file, term_names)
-
-    memberships = {p: set(cache.get(bare[p], [])) for p in proteins}
+    complexes = _go_complex_terms() - {_GO_COMPLEX_ROOT}   # the root itself says nothing
+    memberships: dict[str, set[str]] = {}
+    term_names: dict[str, str] = {}
+    for protein in proteins:
+        terms = cache.get(bare[protein], [])
+        memberships[protein] = {go for go, _ in terms if go in complexes}
+        term_names.update((go, name) for go, name in terms)
     return _order_by_memberships(proteins, memberships, term_names)
