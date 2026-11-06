@@ -270,7 +270,7 @@ No tests for print_matrix / GUI (regression harnesses were used ad hoc — see �
 | `pathway` | KEGG | network/cache, `--species` | **yes** |
 | `complex` | GO cellular component ⊂ protein-containing complex (UniProt + QuickGO) | network/cache, UniProt accessions | **yes** |
 | `size` | longest sequence first; unknown length last | FASTA (else no-op) | no |
-| ~~`cluster`~~ | removed 2026-09-30 (user: "for now") | | |
+| ~~`cluster`, `rcm`, `pathway`~~ | removed 2026-11-06 on user request (KEGG code + `--species`/Species field removed too) | | |
 
 Residue mode applies the mode to parent proteins; section = protein name, always on. Groups of <2 unchanged.
 
@@ -396,3 +396,29 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 - Test-harness lesson: GUI tests that use `winfo_containing` or real input need
   `app.attributes("-topmost", True)`, and runs can be disturbed by the user's own mouse while the
   window is open (seen as a scrolled first dataset) — repeat a run before trusting a diff.
+
+## 12. Session 2026-11-06 (audit: labels, axes, redundancy, older plans)
+
+- Orderings now take `(group, opts: _OrderOptions)` (sequences, species, locations, links); `sort_proteins`/
+  `sort_residues` got a trailing `links=` arg (CLI + GUI pass `sparse`). `cluster` + `rcm` added (study design
+  RQ3 needs HC+OLO and an alternative). `_order_sequence` shares `_cluster_leaf_order` (now with OLO too —
+  order of sequence mode changed slightly vs. before). Checked on 2SDA Links top-500: links within 5 of the
+  diagonal 26 % (confidence) → 49 % (cluster); rcm lowest mean |i-j|.
+- KEGG §8.2 fixed: memberships strip `path:` so sections get pathway names.
+- CLI: first line `rows = Protein1, columns = Protein2 …`; `[section]` lines above row runs (protein level only,
+  `row_sections=False` in residue mode).
+- GUI: corner is a Canvas with axis titles `_AXIS_TITLES`; colour legend (`_legend_image`, `_update_legend`,
+  `_colour_caption`) in Display row 7 and under the PNG export; `_cell_colour`/`_score_to_bg` removed
+  (`_colours_for(scores, ref=None)` is the only colour path); `_group_cells` shared by `_group_links` and the
+  export; label sizes are mode-aware via `_label_sizes(overview)` / `_names_shown` / `_headers_shown`:
+  zoomed out at protein level with sections, the section names stay on both axes (headers only hidden when there
+  are no sections). `_apply_header_layout` also runs on load (fixed stale layout when level/sections changed
+  while zoomed out). Export always uses `_label_sizes(False)`.
+- Verified: CLI goldens identical except the new title line; GUI matrix pixels identical in all 12 harness
+  states; export identical except corner titles + appended legend.
+
+**Later on 2026-11-06 (user request): `cluster`, `rcm` and `pathway` removed again.** KEGG code
+(`order_by_kegg` etc.), `--species` and the GUI Species field are gone (nothing else used them);
+`order_by_go_complex(proteins, locations=False)`; `sort_proteins/sort_residues(items, decoy, mode,
+sequences=None, locations=False)`; `_OrderOptions` = (sequences, locations). `sequence` ordering is back to
+the committed algorithm (no optimal leaf ordering). Modes now: confidence, alpha, sequence, complex, size.

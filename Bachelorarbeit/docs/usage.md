@@ -86,21 +86,22 @@ python scripts/print_matrix.py <csv_path> [options]
 | `--n INT` | number of unique proteins/residues to display (default 1000) |
 | `--order MODE` | axis ordering, see below (default `confidence`) |
 | `--fasta PATH` | FASTA file, required for `--order sequence`; in residue mode it also adds the residues without crosslinks |
-| `--species INT` | NCBI taxonomy ID for KEGG pathway lookups (default 9606, human) |
+| `--locations` | with `--order complex`: group proteins without a complex by their other GO cellular component terms (cytoplasm, membrane, …) instead of putting them all in "Unknown" |
 
 `--order` modes:
 
 - `confidence` — highest-scoring proteins first (default)
 - `alpha` — alphabetical
 - `sequence` — hierarchical clustering by k-mer similarity (needs `--fasta`)
-- `pathway` — grouped by KEGG pathway (needs `--species`)
 - `complex` — grouped by protein complex, taken from the Gene Ontology
   "cellular component" terms in UniProt (only terms that are a kind of
-  *protein-containing complex*, GO:0032991); needs UniProt accessions, not `--species`
+  *protein-containing complex*, GO:0032991); needs UniProt accessions.
+  With `--locations`, proteins outside the complex sections get location
+  sections, placed after the complexes
 - `size` — longest sequence first (needs `--fasta` for real lengths)
 
 In `--level residue` mode, every `--order` mode above is applied to each
-residue's *parent protein* (so pathway/complex/etc. group residues
+residue's *parent protein* (so complex/etc. group residues
 the same way they'd group whole proteins), and residues within a protein are
 then sorted by position. Protein-name section headers are always shown above
 the columns in residue mode, regardless of `--order`.
@@ -111,13 +112,16 @@ Examples:
 python scripts/print_matrix.py data/links.csv
 python scripts/print_matrix.py data/links.csv --n 200 --order alpha
 python scripts/print_matrix.py data/links.csv --order sequence --fasta data/proteins.fasta
-python scripts/print_matrix.py data/links.csv --order pathway --species 9913
+python scripts/print_matrix.py data/links.csv --order complex --locations
 python scripts/print_matrix.py data/links.csv --level residue --order alpha
 ```
 
 Output is a dot-matrix printed to the console (targets before decoys, split
 by a `+`/`-` separator), followed by a score legend, a truncated-name legend,
-and a memory usage summary.
+and a memory usage summary. The first line says which side of a crosslink
+the axes are (rows = Protein1, columns = Protein2). With sections
+(`complex`), each section also gets a `[name]` line above its first row, so
+the sections can be read off on the left as well as on top.
 
 ### Residue-level mode
 
@@ -176,8 +180,9 @@ Opens a Tkinter window. All controls sit in a panel on the left, so the
 matrix uses the full window height; the panel scrolls (mouse wheel over it)
 if the window is too short to show everything. The panel has four groups:
 
-**Data** — the same CSV/FASTA/`--level`/`--order`/`--species` options as
-the CLI, plus **Load**, **Export PNG…** and the load status. Unlike the CLI
+**Data** — the same CSV/FASTA/`--level`/`--order` options as
+the CLI, the **Group rest by location** checkbox (`--locations`, only
+shown for the `complex` order), plus **Load**, **Export PNG…** and the load status. Unlike the CLI
 there is no `--n`: the GUI always loads all proteins or residues of the CSV
 (use zooming out and **Zoom to** to get an overview).
 
@@ -187,7 +192,19 @@ there is no `--n`: the GUI always loads all proteins or residues of the CSV
   also those without crosslinks (same as the CLI); without a
   FASTA only the crosslinked residues are shown.
 - **Export PNG…** — renders the full (unscrolled, un-aggregated) matrix to a
-  PNG file, with the score cutoff applied.
+  PNG file, with the score cutoff applied, the axis titles in the corner and
+  the colour legend under the matrix.
+
+The empty corner above the row names says which side of a crosslink the
+axes are: `row: Protein1 ↓`, `col: Protein2 →` (the CSV row A,B is in row A,
+column B).
+
+Section names (complex, or the protein in residue mode) are shown
+above the columns and, turned to read bottom to top, left of the row labels,
+so links between two sections can be read off from both axes. A name that
+doesn't fit on one line is wrapped onto a second; if it still doesn't fit,
+it's cut off with "…" (clicking a cell shows the full name in Selection). A
+section bigger than the view keeps its name centred on the visible part.
 
 **Display**
 
@@ -196,6 +213,10 @@ there is no `--n`: the GUI always loads all proteins or residues of the CSV
   With a colormap, the colour follows the rank of a score among all scores
   (quantile), so the colours are spread evenly even when most scores lie
   close together.
+  The colour legend under **Fold** shows what the colours mean right now:
+  what a cell holds (score, an Aggregate of scores, or crosslinks per cell),
+  whether colours follow the rank or are linear, and the smallest, middle
+  and largest value.
 - **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
   score. Zooming below 4 px merges neighbouring items into blocks. The
   slider zooms around the middle of the view. Big matrices (e.g. residue
@@ -203,12 +224,18 @@ there is no `--n`: the GUI always loads all proteins or residues of the CSV
   about 200 px. Blocks never cross the target/decoy line. Sections (e.g.
   the proteins in residue mode) smaller than a block are packed into one
   block whole; bigger ones are cut into several blocks. While zoomed out
-  into blocks, the column headers and row labels are hidden (they can't be
-  read at that size anyway): the matrix uses the whole area, with a little
-  padding and a grey border around it.
+  into blocks, the single item names are hidden (they can't be read at that
+  size anyway), with a little padding and a grey border around the matrix.
+  If the order has sections (`complex`), their names stay on both
+  axes, since that's the view where links between sections are looked at;
+  otherwise the headers go completely and the matrix uses the whole area.
+  In residue mode the names stay instead,
+  as a sparse position axis — one tick per block, spaced out so the numbers
+  don't overlap — so there's still a sense of where you are even zoomed
+  out past individual residues.
 - **Zoom to** — **All** zooms and centers so that all quadrants that are
-  switched on fill the view (counting the space of the hidden labels when
-  the result is zoomed out into blocks); **TT**, **TD**, **DT** and **DD** do the same
+  switched on fill the view (counting the room the labels take at the
+  resulting zoom); **TT**, **TD**, **DT** and **DD** do the same
   for one quadrant and switch it on first if it was hidden. Buttons for
   quadrants without items (e.g. no decoys loaded) are greyed out.
 - **Aggregate** — what a block shows: the geometric mean of its scores
@@ -249,7 +276,7 @@ the left mouse button and drag to move the matrix (the column headers and
 row labels move along). The scrollbars and the arrow keys scroll as well.
 
 **Selection** — click a cell to see both proteins' names, decoy status,
-section (if pathway/complex ordering is active), and the crosslink scores in
+section (if complex ordering is active), and the crosslink scores in
 both directions: `row→col` (the clicked cell) and `col→row` (its mirror
 cell) — in residue mode, also the residue position. A cell hidden by the
 cutoff shows its score marked `(hidden by cutoff)`. When zoomed out into
@@ -262,19 +289,17 @@ If `pygame` is installed, the matrix canvas renders through an embedded SDL2
 surface for smoother scrolling on large matrices; otherwise it falls back to
 a pure numpy/PIL renderer.
 
-## Pathway/complex lookups: `scripts/fetch_group_order.py`
+## Complex lookups: `scripts/fetch_group_order.py`
 
-Not run directly — it's the backend for `--order pathway` / `--order complex`
-and exposes two functions:
+Not run directly — it's the backend for `--order complex` and exposes:
 
 ```python
-order_by_kegg(proteins: list[str], species: int) -> tuple[list[str], dict[str, str]]
-order_by_go_complex(proteins: list[str], species: int) -> tuple[list[str], dict[str, str]]
+order_by_go_complex(proteins: list[str], locations: bool = False) -> tuple[list[str], dict[str, str]]
 ```
 
-Both return the reordered protein list plus a `{protein: section_label}`
+It returns the reordered protein list plus a `{protein: section_label}`
 dict used for the section headers. Results are cached on disk under
-`~/.cache/xlms_matrix/` so repeated lookups don't hit KEGG, UniProt or
+`~/.cache/xlms_matrix/` so repeated lookups don't hit UniProt or
 QuickGO again. `order_by_go_complex` asks UniProt for the GO cellular
 component terms of each accession (cached per protein in
 `go/uniprot_cellular_component.json`) and keeps only the terms below

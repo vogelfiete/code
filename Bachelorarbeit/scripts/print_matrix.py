@@ -23,7 +23,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fetch_group_order import order_by_go_complex, order_by_kegg, short_accession
+from fetch_group_order import order_by_go_complex, short_accession
 from xlms.io import read_fasta
 
 
@@ -66,6 +66,33 @@ class ResidueId(NamedTuple):
 def protein_of(item) -> str:
     """The protein an axis item belongs to (works for both kinds of item)."""
     return item.protein if isinstance(item, ResidueId) else item
+
+
+# -----------------------------------------------------------------------------
+# Matching CSV protein names against FASTA sequences
+#
+# The CSV and the FASTA don't always name a protein the same way: the CSV
+# might say "sp|P12345|PROT_HUMAN" while the FASTA header is just "P12345"
+# (or the other way round, or the FASTA is missing the "sp|...|" wrapping).
+# A plain dict lookup only finds a sequence when both sides spell the name
+# identically, which silently drops residues for every protein that
+# doesn't — looking up by accession as well catches the common cases.
+# -----------------------------------------------------------------------------
+
+def seq_index(sequences: dict[str, str]) -> dict[str, str]:
+    """`sequences`, plus every sequence also reachable by its bare accession
+    (so a FASTA header can be shorter or longer than the CSV's protein name
+    and still match, as long as they share the same accession)."""
+    index = dict(sequences)
+    for name, seq in sequences.items():
+        index.setdefault(short_accession(name), seq)
+    return index
+
+
+def find_sequence(protein: str, index: dict[str, str]) -> str | None:
+    """`protein`'s sequence from an index built by seq_index, trying the
+    name as given first and then its bare accession."""
+    return index.get(protein, index.get(short_accession(protein)))
 
 
 # -----------------------------------------------------------------------------
@@ -315,8 +342,9 @@ def add_unlinked_residues(
     they show up as empty cells."""
     proteins = list(dict.fromkeys(r.protein for r in residues))
     protein_is_decoy = {r.protein: residue_is_decoy[r] for r in residues}
+    index = seq_index(sequences)
 
-    missing = [p for p in proteins if p not in sequences]
+    missing = [p for p in proteins if find_sequence(p, index) is None]
     if missing:
         warnings.warn(
             f"{len(missing)} protein(s) not found in FASTA — only linked "
@@ -327,7 +355,8 @@ def add_unlinked_residues(
     is_decoy = dict(residue_is_decoy)
     existing = set(residues)
     for protein in proteins:
-        for pos in range(1, len(sequences.get(protein, "")) + 1):
+        seq = find_sequence(protein, index) or ""
+        for pos in range(1, len(seq) + 1):
             rid = ResidueId(protein, pos)
             if rid not in existing:
                 existing.add(rid)
@@ -340,24 +369,31 @@ def add_unlinked_residues(
 # Putting the axes in a useful order
 #
 # Every ordering gets a group of proteins and returns them reordered, plus
-# optional section names (used for the pathway and complex groupings).
+# optional section names (used for the complex grouping).
 # Targets and decoys are always ordered separately.
 # -----------------------------------------------------------------------------
 
-def _order_alpha(group, sequences, species):
+class _OrderOptions(NamedTuple):
+    """Everything an ordering may need besides the proteins themselves.
+    Most orderings only use one of these."""
+    sequences: dict[str, str] | None = None   # FASTA sequences ("sequence", "size")
+    locations: bool = False                   # group the rest by location ("complex")
+
+
+def _order_alpha(group, opts):
     return sorted(group), None
 
 
-def _order_sequence(group, sequences, species):
+def _order_sequence(group, opts):
     """Put proteins with similar sequences next to each other. Similarity is
     estimated from how often each 3-letter piece occurs, which is rough but fast."""
     import numpy as np
     from scipy.cluster.hierarchy import leaves_list, linkage
     from scipy.spatial.distance import cdist, squareform
 
-    sequences = sequences or {}
-    present = [p for p in group if p in sequences]
-    missing = [p for p in group if p not in sequences]
+    index = seq_index(opts.sequences or {})
+    present = [p for p in group if find_sequence(p, index) is not None]
+    missing = [p for p in group if find_sequence(p, index) is None]
     if missing:
         warnings.warn(f"{len(missing)} protein(s) not found in FASTA, appended at end: {missing}")
     if len(present) < 2:
@@ -366,13 +402,13 @@ def _order_sequence(group, sequences, species):
     k = 3
     kmer_index: dict[str, int] = {}
     for p in present:
-        seq = sequences[p]
+        seq = find_sequence(p, index)
         for i in range(len(seq) - k + 1):
             kmer_index.setdefault(seq[i:i + k], len(kmer_index))
 
     freq = np.zeros((len(present), len(kmer_index)))
     for row, p in enumerate(present):
-        seq = sequences[p]
+        seq = find_sequence(p, index)
         for i in range(len(seq) - k + 1):
             freq[row, kmer_index[seq[i:i + k]]] += 1
         total = freq[row].sum()
@@ -385,36 +421,34 @@ def _order_sequence(group, sequences, species):
     return [present[i] for i in order] + missing, None
 
 
-def _order_size(group, sequences, species):
+def _order_size(group, opts):
     """Longest protein first; proteins without a known sequence go last."""
+    index = seq_index(opts.sequences) if opts.sequences else {}
+
     def key(p: str) -> int:
-        return -len(sequences[p]) if sequences and p in sequences else 1
+        seq = find_sequence(p, index)
+        return -len(seq) if seq else 1
     return sorted(group, key=key), None
 
 
-def _order_pathway(group, sequences, species):
-    return order_by_kegg(group, species)
-
-
-def _order_complex(group, sequences, species):
-    return order_by_go_complex(group, species)
+def _order_complex(group, opts):
+    return order_by_go_complex(group, opts.locations)
 
 
 _ORDERINGS = {
     "alpha": _order_alpha,
     "sequence": _order_sequence,
-    "pathway": _order_pathway,
     "complex": _order_complex,
     "size": _order_size,
 }
 ORDER_MODES = ["confidence", *_ORDERINGS]   # "confidence" just keeps the order we already have
 
 
-def _apply_order(group, mode, sequences, species=9606):
+def _apply_order(group, mode, opts: _OrderOptions):
     ordering = _ORDERINGS.get(mode)
     if ordering is None or len(group) < 2:
         return group, None
-    return ordering(group, sequences, species)
+    return ordering(group, opts)
 
 
 def sort_proteins(
@@ -422,13 +456,15 @@ def sort_proteins(
     protein_is_decoy: dict[str, bool],
     mode: str,
     sequences: dict[str, str] | None = None,
-    species: int = 9606,
+    locations: bool = False,
 ) -> tuple[list[str], dict[str, str] | None]:
-    """Reorder the proteins with the chosen mode, targets still before decoys."""
+    """Reorder the proteins with the chosen mode, targets still before decoys.
+    `locations` only matters for "complex": see order_by_go_complex()."""
+    opts = _OrderOptions(sequences, locations)
     targets = [p for p in proteins if not protein_is_decoy.get(p, False)]
     decoys = [p for p in proteins if protein_is_decoy.get(p, False)]
-    t_ordered, t_sections = _apply_order(targets, mode, sequences, species)
-    d_ordered, d_sections = _apply_order(decoys, mode, sequences, species)
+    t_ordered, t_sections = _apply_order(targets, mode, opts)
+    d_ordered, d_sections = _apply_order(decoys, mode, opts)
     sections = {**(t_sections or {}), **(d_sections or {})} or None
     return t_ordered + d_ordered, sections
 
@@ -438,7 +474,7 @@ def sort_residues(
     residue_is_decoy: dict[ResidueId, bool],
     mode: str,
     sequences: dict[str, str] | None = None,
-    species: int = 9606,
+    locations: bool = False,
 ) -> tuple[list[ResidueId], dict[ResidueId, str]]:
     """Order the proteins the residues belong to, then list each protein's
     residues by position. Each residue's section is its protein."""
@@ -446,7 +482,7 @@ def sort_residues(
     proteins = list(dict.fromkeys(r.protein for r in residues))
     protein_is_decoy = {r.protein: residue_is_decoy[r] for r in residues}
 
-    ordered_proteins, _ = sort_proteins(proteins, protein_is_decoy, mode, sequences, species)
+    ordered_proteins, _ = sort_proteins(proteins, protein_is_decoy, mode, sequences, locations)
 
     by_protein: dict[str, list[ResidueId]] = {}
     for r in residues:
@@ -511,10 +547,13 @@ def print_matrix(
     col_label_fn=None,
     row_label_fn=None,
     legend_source: str = "col",
+    row_sections: bool = True,
 ) -> None:
     """Print the dot matrix. `items` are protein names or residues.
     legend_source ("col" or "row") says which labels the name legend at the
-    bottom explains."""
+    bottom explains. With row_sections, each section also gets a [name]
+    line above its first row, so the sections can be read off on the left
+    too (not needed when the row labels already say it, as in residue mode)."""
     col_label_fn = col_label_fn or (lambda p: _truncate(p, COL_W))
     row_label_fn = row_label_fn or (lambda p: _truncate(p, ROW_W))
 
@@ -526,6 +565,8 @@ def print_matrix(
     has_sep = 0 < split < n
     row_prefix = " " * (ROW_W + 2)
 
+    # The matrix has a direction, so say which side of a crosslink is which
+    print("rows = Protein1, columns = Protein2 (a crosslink A,B is in row A, column B)")
     if sections:
         print(_section_header_line(items, sections, split, row_prefix))
 
@@ -542,6 +583,10 @@ def print_matrix(
     for row, pi in enumerate(items):
         if has_sep and row == split:
             print("-" * (ROW_W + 2) + _col_separator_line(n, split))
+        if sections and row_sections:
+            label = sections.get(pi, "")
+            if row == 0 or row == split or label != sections.get(items[row - 1], ""):
+                print(f"[{label}]" if label else "[–]")
         line = row_labels[row].ljust(ROW_W) + "  "
         for col, pj in enumerate(items):
             if has_sep and col == split:
@@ -597,14 +642,14 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=DEFAULT_N,
                         help=f"Number of unique proteins/residues (default {DEFAULT_N})")
     parser.add_argument("--order", choices=ORDER_MODES, default="confidence",
-                        help="Axis ordering: confidence (default), alpha, "
-                             "sequence, pathway (KEGG), complex (GO cellular component), "
-                             "size (longest sequence first)")
+                        help="Axis ordering: confidence (default), alpha, sequence, "
+                             "complex (GO cellular component), size (longest sequence first)")
     parser.add_argument("--fasta", default=None,
                         help="FASTA file path (required for --order sequence; in residue "
                              "mode it also adds the residues without crosslinks)")
-    parser.add_argument("--species", type=int, default=9606,
-                        help="NCBI taxonomy ID for external DB queries (default 9606 = human)")
+    parser.add_argument("--locations", action="store_true",
+                        help="With --order complex: group proteins without a complex by "
+                             "their cellular location instead of putting them in Unknown")
     args = parser.parse_args()
 
     if args.order == "sequence" and not args.fasta:
@@ -624,14 +669,15 @@ def main() -> None:
             # with a FASTA, every residue of the loaded proteins is shown,
             # not only the crosslinked ones
             items, is_decoy = add_unlinked_residues(items, is_decoy, sequences)
-        items, sections = sort_residues(items, is_decoy, args.order, sequences, args.species)
+        items, sections = sort_residues(items, is_decoy, args.order, sequences, args.locations)
         labels = dict(
             col_label_fn=lambda r: _truncate(str(r.pos), COL_W),
             row_label_fn=lambda r: _truncate(f"{short_accession(r.protein)}:{r.pos}", ROW_W),
             legend_source="row",
+            row_sections=False,   # the row labels already name the protein
         )
     else:
-        items, sections = sort_proteins(items, is_decoy, args.order, sequences, args.species)
+        items, sections = sort_proteins(items, is_decoy, args.order, sequences, args.locations)
         labels = {}
 
     _, peak_traced = tracemalloc.get_traced_memory()
