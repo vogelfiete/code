@@ -47,10 +47,11 @@ uninstall pygame (`python -m pip uninstall pygame`) to use the numpy renderer.
   (case-insensitive), plus one of two decoy-label formats:
   - `Decoy1` / `Decoy2` (per-protein booleans), or
   - `isTT` / `isDD` (per-link target/decoy classification)
-  - For `--level residue` (see below), also needs residue-position columns,
-    in one of two formats:
-    - **direct**: `SeqPos1`/`SeqPos2`, `Pos1`/`Pos2`, or `Position1`/
-      `Position2` — the residue's absolute position in the protein.
+  - For `--level residue` (see below) and for opening proteins in the GUI,
+    also needs residue-position columns, in one of two formats:
+    - **direct**: `SeqPos1`/`SeqPos2`, `Pos1`/`Pos2`, `Position1`/
+      `Position2`, or `fromSite`/`ToSite` (xiFDR "Links" files) — the
+      residue's absolute position in the protein.
     - **peptide + link offset**: `PepPos1`/`PepPos2` (where the linked
       peptide starts in the protein) together with `LinkPos1`/`LinkPos2`
       (the crosslinked residue's 1-based offset within that peptide). The
@@ -97,7 +98,10 @@ python scripts/print_matrix.py <csv_path> [options]
   "cellular component" terms in UniProt (only terms that are a kind of
   *protein-containing complex*, GO:0032991); needs UniProt accessions.
   With `--locations`, proteins outside the complex sections get location
-  sections, placed after the complexes
+  sections, placed after the complexes. Complexes that are part of a bigger
+  one (the large and the small ribosomal subunit are part of the ribosome)
+  stay next to each other, and the bigger complex gets its own banner line
+  above the section line
 - `size` — longest sequence first (needs `--fasta` for real lengths)
 
 In `--level residue` mode, every `--order` mode above is applied to each
@@ -121,7 +125,8 @@ by a `+`/`-` separator), followed by a score legend, a truncated-name legend,
 and a memory usage summary. The first line says which side of a crosslink
 the axes are (rows = Protein1, columns = Protein2). With sections
 (`complex`), each section also gets a `[name]` line above its first row, so
-the sections can be read off on the left as well as on top.
+the sections can be read off on the left as well as on top; a section inside
+a bigger complex is written `[bigger > section]`.
 
 ### Residue-level mode
 
@@ -180,31 +185,52 @@ Opens a Tkinter window. All controls sit in a panel on the left, so the
 matrix uses the full window height; the panel scrolls (mouse wheel over it)
 if the window is too short to show everything. The panel has four groups:
 
-**Data** — the same CSV/FASTA/`--level`/`--order` options as
-the CLI, the **Group rest by location** checkbox (`--locations`, only
-shown for the `complex` order), plus **Load**, **Export PNG…** and the load status. Unlike the CLI
-there is no `--n`: the GUI always loads all proteins or residues of the CSV
-(use zooming out and **Zoom to** to get an overview).
+**Data** — the same CSV/FASTA/`--order` options as the CLI, the **Group
+rest by location** checkbox (`--locations`, only shown for the `complex`
+order), plus **Load**, **Export PNG…** and the load status. Unlike the CLI
+there is no `--n` and no `--level`: the GUI always loads all proteins and,
+if the CSV has residue-position columns, all their residues too, and starts
+at protein level (see *The axis tree* below). With a FASTA file, every
+residue of the loaded proteins is there, also those without crosslinks
+(same as the CLI); without a FASTA only the crosslinked residues are.
 
-- **Level** — `protein` (default) or `residue`; switches the axis unit.
-  Requires the CSV to have residue-position columns (see above). In residue
-  mode with a FASTA file, every residue of the loaded proteins is shown,
-  also those without crosslinks (same as the CLI); without a
-  FASTA only the crosslinked residues are shown.
-- **Export PNG…** — renders the full (unscrolled, un-aggregated) matrix to a
-  PNG file, with the score cutoff applied, the axis titles in the corner and
-  the colour legend under the matrix.
+- **Export PNG…** — renders the full (unscrolled, unblocked) matrix to a PNG
+  file, opened as it is on screen, with the score cutoff applied, the axis
+  titles in the corner, the annotation tracks and the colour legend under
+  the matrix.
 
 The empty corner above the row names says which side of a crosslink the
 axes are: `row: Protein1 ↓`, `col: Protein2 →` (the CSV row A,B is in row A,
 column B).
 
-Section names (complex, or the protein in residue mode) are shown
-above the columns and, turned to read bottom to top, left of the row labels,
-so links between two sections can be read off from both axes. A name that
-doesn't fit on one line is wrapped onto a second; if it still doesn't fit,
-it's cut off with "…" (clicking a cell shows the full name in Selection). A
-section bigger than the view keeps its name centred on the visible part.
+**The axis tree** — the axes are a tree: with the `complex` order,
+proteins sit in their complex, and complexes that are part of a bigger one
+sit in that (e.g. *ribosome* → *cytosolic ribosome* → *cytosolic large
+ribosomal subunit*); every protein holds its residues. Rows and columns
+always show the same nodes. Each open group or protein gets a band with its
+name above the columns and, turned to read bottom to top, left of the row
+labels — one band row per level — so links between two groups can be read
+off from both axes.
+
+- **Click a name** (a column header or a row label) to open it: a protein
+  opens into its residues, a closed group (written `+name`) into what it
+  holds.
+- **Click a band** to close that group or protein again: it becomes a single
+  row and column, whose cells combine all its crosslinks with the
+  **Aggregate** method.
+- **Show** (in Display) sets the whole tree at once: **Top** closes the
+  biggest groups, **Complex** the smallest ones (so every complex is one
+  row), **Protein** shows every protein and **Residue** every residue.
+
+Proteins and residues can be mixed: a closed protein next to an open one
+gets the crosslinks between it and each of the open protein's residues.
+Opening or closing keeps the clicked node where it was on screen. Proteins
+can only be opened when the CSV has residue positions.
+
+A band name that doesn't fit on one line is wrapped onto a second; if it
+still doesn't fit, it's cut off with "…" (clicking a cell shows the full
+name in Selection). A band bigger than the view keeps its name centred on
+the visible part.
 
 **Display**
 
@@ -221,15 +247,15 @@ section bigger than the view keeps its name centred on the visible part.
   score. Zooming below 4 px merges neighbouring items into blocks. The
   slider zooms around the middle of the view. Big matrices (e.g. residue
   level) get extra zoom steps, so the whole matrix can be zoomed out to
-  about 200 px. Blocks never cross the target/decoy line. Sections (e.g.
-  the proteins in residue mode) smaller than a block are packed into one
+  about 200 px. Blocks never cross the target/decoy line. Runs of nodes
+  under the same group or protein smaller than a block are packed into one
   block whole; bigger ones are cut into several blocks. While zoomed out
   into blocks, the single item names are hidden (they can't be read at that
   size anyway), with a little padding and a grey border around the matrix.
-  If the order has sections (`complex`), their names stay on both
-  axes, since that's the view where links between sections are looked at;
-  otherwise the headers go completely and the matrix uses the whole area.
-  In residue mode the names stay instead,
+  The band names of open groups and proteins stay on both axes, since
+  that's the view where links between groups are looked at; without any
+  bands the headers go completely and the matrix uses the whole area.
+  While residues are on the axes the names stay instead,
   as a sparse position axis — one tick per block, spaced out so the numbers
   don't overlap — so there's still a sense of where you are even zoomed
   out past individual residues.
@@ -251,6 +277,8 @@ section bigger than the view keeps its name centred on the visible part.
   half stays empty. TD links fold into the DT quadrant. Clicking the empty
   half selects the mirror cell; the selection shows both directions and the
   combined value. **Export PNG…** exports the folded matrix too.
+- **Show** — **Top**, **Complex**, **Protein**, **Residue**, see *The axis
+  tree* above.
 
 Column names in the header are written at 45°, going up to the right from
 the middle of their column.
@@ -262,28 +290,49 @@ in that quadrant; like the cutoff, they are then left out of block
 aggregates, the PNG export and the "links shown" count. A clicked cell in a
 hidden quadrant is marked `(hidden: TD quadrant)` and so on.
 
+**Annotations** — UniProt sequence features as coloured tracks along the
+residue rows and columns, one thin strip per type next to the matrix:
+**Helix**, **Beta strand**, **Turn**, **Binding site**, **Active site**,
+**Domain**, **Transmembrane** and **Modified residue**, each with its own
+colour (shown next to its checkbox). The features of all loaded proteins
+are fetched in the background the first time a type is ticked, and cached
+in `~/.cache/xlms_matrix/uniprot/features.json`. Tracks only appear while
+residues are on the axes; zoomed out into blocks, a block is coloured if
+any of its residues has the feature. Clicking a residue cell lists the
+features it lies in under Selection.
+
 **Score cutoff** — one slider with two handles: the left handle is the
 bottom limit, the right handle the top limit (both inclusive). Cells whose
 score is outside the range are hidden; they are also left out of block
 aggregates and of the PNG export. Colours keep the full-range scale, so a
-score has the same colour whatever the cutoff. The label shows the range and
-how many links are visible; **Reset** restores the full range. Loading new
-data resets the cutoff.
+score has the same colour whatever the cutoff. Above the slider, on the same
+score scale, a plot shows how the scores of the crosslinks on the axes are
+spread: targets (TT) as blue bars, decoys (TD, DT, DD) as an orange line,
+on a logarithmic count scale; only the quadrants that are switched on count,
+and bins outside the cutoff turn grey. The label shows the range and how
+many links are visible; **Reset** restores the full range. Loading new data
+resets the cutoff.
 
 **Moving around** — the matrix works like a map. Turn the mouse wheel over
-it to zoom in and out; the spot under the pointer stays where it is. Hold
-the left mouse button and drag to move the matrix (the column headers and
-row labels move along). The scrollbars and the arrow keys scroll as well.
+it (or over the column headers or row labels) to zoom in and out; the spot
+under the pointer stays where it is, also near the matrix edges and when
+blocks start or stop — for that the view can be moved past the edges until
+only a small part of the matrix is left. Hold the left mouse button and
+drag to move the matrix (the column headers and row labels move along). The
+scrollbars and the arrow keys scroll as well.
 
-**Selection** — click a cell to see both proteins' names, decoy status,
-section (if complex ordering is active), and the crosslink scores in
-both directions: `row→col` (the clicked cell) and `col→row` (its mirror
-cell) — in residue mode, also the residue position. A cell hidden by the
+**Selection** — click a cell to see both sides' names (a protein, a
+residue, or a closed group with its number of proteins), decoy status, the
+group they are in, and the crosslink scores in both directions: `row→col`
+(the clicked cell) and `col→row` (its mirror cell) — for residues also the
+position and the annotations they lie in. A cell hidden by the
 cutoff shows its score marked `(hidden by cutoff)`. When zoomed out into
-blocks, the aggregated score of each direction is shown. Clicking also
+blocks or on a closed group, the aggregated score of each direction is
+shown. Clicking also
 triggers a background UniProt lookup for the full protein name and length.
 A click only counts if the mouse wasn't dragged in between, and the
-selection stays on the same proteins when you zoom.
+selection stays on the same proteins when you zoom (opening or closing
+clears it).
 
 If `pygame` is installed, the matrix canvas renders through an embedded SDL2
 surface for smoother scrolling on large matrices; otherwise it falls back to
@@ -298,7 +347,21 @@ order_by_go_complex(proteins: list[str], locations: bool = False) -> tuple[list[
 ```
 
 It returns the reordered protein list plus a `{protein: section_label}`
-dict used for the section headers. Results are cached on disk under
+dict used for the section headers.
+
+```python
+complex_hierarchy(sections) -> dict[str, str]
+```
+
+For those section names it returns the bigger complexes they are part of,
+as `{name: name one level up}`. It follows the GO *part of* relations
+(through QuickGO, cached in `go/ancestors_*.json`), keeps only assemblies
+(kinds of protein-containing complex or of membraneless organelle — GO
+files the ribosome there), not places like *cytosol*, and only those that
+hold at least two of the sections; a general term (*ribosome*) that a more
+specific one (*cytosolic ribosome*) already covers is dropped. The
+`complex` ordering uses it to keep subunits together, the CLI for its
+banner lines and the GUI for the axis tree. Results are cached on disk under
 `~/.cache/xlms_matrix/` so repeated lookups don't hit UniProt or
 QuickGO again. `order_by_go_complex` asks UniProt for the GO cellular
 component terms of each accession (cached per protein in
@@ -308,6 +371,19 @@ component terms of each accession (cached per protein in
 annotation of the main entry; names that aren't UniProt accessions (e.g.
 `decoy:P01267`) end up in "Unknown". Delete the cache files to fetch
 fresh annotations.
+
+## Annotations: `scripts/fetch_features.py`
+
+Backend for the GUI's annotation tracks:
+
+```python
+features_for(proteins: list[str]) -> dict[str, list[list]]
+```
+
+returns `{protein: [[type, start, end, text], ...]}` for the feature types
+in `FEATURE_TYPES`, from the UniProt REST API in batches of 100 (positions
+from 1, both ends included; `text` is the description, or the ligand of a
+binding site). Cached per accession in `uniprot/features.json`.
 
 ## `xlms` package (`src/xlms`)
 

@@ -4,8 +4,10 @@ See docs/usage.md for how to use it.
 The data comes from the same code the command line tool uses
 (scripts/print_matrix.py). The matrix is drawn either through an embedded
 pygame window, which is faster, or without pygame as a plain numpy/PIL image.
-When you zoom out far enough, neighbouring rows and columns are merged into
-blocks and their scores are combined."""
+The axes are a tree: complexes hold proteins, proteins hold residues, and
+clicking the axis labels opens or closes them. When you zoom out far
+enough, neighbouring rows and columns are merged into blocks and their
+scores are combined."""
 from __future__ import annotations
 
 import json
@@ -40,6 +42,7 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_DIR, "..", "scripts"))
 sys.path.insert(0, os.path.join(_DIR, "..", "src"))
 
+from fetch_features import FEATURE_TYPES, features_for  # type: ignore[import]
 from print_matrix import (  # type: ignore[import]
     COL_W,
     ORDER_MODES,
@@ -47,12 +50,11 @@ from print_matrix import (  # type: ignore[import]
     add_unlinked_residues,
     build_matrix,
     build_residue_matrix,
+    complex_hierarchy,
     find_sequence,
-    protein_of,
     seq_index,
     short_accession,
     sort_proteins,
-    sort_residues,
 )
 from xlms.io import read_fasta  # type: ignore[import]
 
@@ -73,6 +75,7 @@ BLOCK_ZOOM_STEPS = 20     # at least this many slider steps below CELL_PX_MIN ar
 BLOCK_ZOOM_GROWTH = 1.12  # each step makes blocks this much bigger (feels like a log zoom)
 ZOOM_OUT_FIT_PX = 200     # big matrices get more block steps, until the whole matrix fits into this many pixels
 OVERVIEW_PAD_PX = 12      # zoomed out into blocks: empty space around the matrix
+MIN_VISIBLE_PX = 40       # the view can be moved past the matrix edges until only this much of it is left
 AXIS_TICK_PX = 4          # length of a position tick mark on the residue axis
 AXIS_TICK_GAP_PX = 6      # minimum empty space kept between two tick labels
 _AGG_METHODS = {"Geometric Mean": "geomean", "Max Score": "max",
@@ -95,6 +98,23 @@ _BG = (255, 255, 255)
 _FG = (0, 0, 0)
 _SEP = (153, 153, 153)
 _HL = (0, 120, 215)  # outline of the selected cell
+
+# Annotation tracks: one thin coloured strip per feature type along the
+# residue axes, in a fixed colour per type
+TRACK_PX = 4              # thickness of one track
+TRACK_GAP_PX = 1          # space between two tracks
+_FEATURE_COLOURS = dict(zip(FEATURE_TYPES, [
+    "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]))
+
+# What the "Show" buttons open: every group and protein is set to fit
+_SHOW_LEVELS = ["Top", "Complex", "Protein", "Residue"]
+
+# Score distribution above the cutoff slider
+HIST_H = 56               # height of the plot in pixels
+HIST_BINS = 40
+_TARGET_COLOUR = "#2a78d6"
+_DECOY_COLOUR = "#eb6834"
+_OUTSIDE_COLOUR = "#d4d4d4"   # bars outside the cutoff
 
 # The first of these fonts that exists is used (Windows, then Linux, then
 # macOS). If none is found, Pillow's own font is used.
@@ -226,12 +246,15 @@ def _group_cells(rows: np.ndarray, cols: np.ndarray, scores: np.ndarray, n: int,
 
 class RangeSlider(tk.Canvas):
     """Pick a range [lo, hi] inside [min, max]. command(lo, hi) is called
-    while you drag, release_command(lo, hi) when you let go."""
+    while you drag, release_command(lo, hi) when you let go. Above the
+    track it shows how the scores are spread (set_distribution), on the
+    same scale as the handles, with the part outside the range greyed out."""
     PAD = 9       # space between the canvas edge and the end of the track
     HANDLE = 5    # half the width of a handle
+    TRACK_H = 26  # height of the part with the handles
 
     def __init__(self, master, command, release_command, **kw) -> None:
-        kw.setdefault("height", 26)
+        kw.setdefault("height", HIST_H + self.TRACK_H)
         kw.setdefault("highlightthickness", 0)
         super().__init__(master, **kw)
         self._command = command
@@ -239,6 +262,8 @@ class RangeSlider(tk.Canvas):
         self._min, self._max = 0.0, 1.0
         self._lo, self._hi = 0.0, 1.0
         self._drag: str | None = None   # which handle is being dragged: "lo", "hi" or None
+        # number of target and decoy scores per bin, see set_distribution
+        self._counts: tuple[np.ndarray, np.ndarray] | None = None
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
@@ -253,6 +278,16 @@ class RangeSlider(tk.Canvas):
     def values(self) -> tuple[float, float]:
         return self._lo, self._hi
 
+    def set_distribution(self, targets: np.ndarray, decoys: np.ndarray) -> None:
+        """Show how the target and decoy scores are spread over [min, max]:
+        targets as bars, decoys as a line, both counted in HIST_BINS bins."""
+        edges = np.linspace(self._min, self._max, HIST_BINS + 1) if self._max > self._min else None
+        if edges is None:
+            self._counts = None
+        else:
+            self._counts = (np.histogram(targets, edges)[0], np.histogram(decoys, edges)[0])
+        self._redraw()
+
     def _x(self, value: float) -> float:
         span = self._max - self._min
         frac = (value - self._min) / span if span > 0 else 0.0
@@ -266,9 +301,51 @@ class RangeSlider(tk.Canvas):
             return self._max
         return self._min + frac * (self._max - self._min)
 
+    def _draw_distribution(self) -> None:
+        """Bars for the targets, a line for the decoys, on one common
+        logarithmic count scale (the many low-scoring decoys would flatten
+        everything else). Bins outside [lo, hi] are grey. A small legend
+        sits in the top left."""
+        if self._counts is None:
+            return
+        targets, decoys = self._counts
+        top, bottom = 14, HIST_H - 2   # room for the legend above the bars
+        highest = max(int(targets.max(initial=0)), int(decoys.max(initial=0)), 1)
+        edges = np.linspace(self._min, self._max, HIST_BINS + 1)
+
+        def y(count: int) -> float:
+            return bottom - math.log1p(count) / math.log1p(highest) * (bottom - top)
+
+        decoy_line: list[float] = []
+        for k in range(HIST_BINS):
+            x0, x1 = self._x(edges[k]), self._x(edges[k + 1])
+            inside = edges[k + 1] >= self._lo and edges[k] <= self._hi
+            if targets[k]:
+                self.create_rectangle(x0 + 0.5, y(targets[k]), x1 - 0.5, bottom,
+                                      fill=_TARGET_COLOUR if inside else _OUTSIDE_COLOUR, width=0)
+            decoy_line += [x0, y(decoys[k]), x1, y(decoys[k])]
+        if decoys.any():
+            self.create_line(*decoy_line, fill=_DECOY_COLOUR, width=2)
+        self.create_line(self.PAD, bottom, self.winfo_width() - self.PAD, bottom, fill="#999999")
+        # the cutoff as two thin lines over the plot
+        for value in (self._lo, self._hi):
+            self.create_line(self._x(value), top, self._x(value), bottom, fill="#1a6fb5", dash=(2, 2))
+        # legend: colour mark + name in normal text colour
+        x = self.PAD
+        for colour, name, line in ((_TARGET_COLOUR, "target", False), (_DECOY_COLOUR, "decoy", True)):
+            if line:
+                self.create_line(x, 6, x + 10, 6, fill=colour, width=2)
+            else:
+                self.create_rectangle(x, 2, x + 10, 10, fill=colour, width=0)
+            item = self.create_text(x + 14, 6, text=name, anchor="w", font=("TkDefaultFont", 8))
+            x = self.bbox(item)[2] + 10
+        self.create_text(self.winfo_width() - self.PAD, 6, text=f"max {highest}, log", anchor="e",
+                         font=("TkDefaultFont", 8), fill="gray")
+
     def _redraw(self) -> None:
         self.delete("all")
-        y = self.winfo_height() // 2
+        self._draw_distribution()
+        y = HIST_H + self.TRACK_H // 2
         xl, xh = self._x(self._lo), self._x(self._hi)
         self.create_line(self.PAD, y, self.winfo_width() - self.PAD, y, fill="#bbbbbb", width=4)
         self.create_line(xl, y, xh, y, fill="#1a6fb5", width=4)
@@ -308,6 +385,99 @@ class RangeSlider(tk.Canvas):
 
 
 # -----------------------------------------------------------------------------
+# The axis tree
+#
+# What stands on the axes is a tree: groups of proteins (complexes, or
+# places with "Group rest by location") can sit inside bigger groups, a
+# group holds proteins, and a protein holds its residues. An open node shows
+# its children on the axes, a closed one stands there as a single row and
+# column. Rows and columns always show the same nodes.
+# -----------------------------------------------------------------------------
+
+class AxisNode:
+    """A group, a protein or a residue. key is the group name, the protein
+    name or the ResidueId."""
+    __slots__ = ("kind", "key", "name", "decoy", "parent", "children", "open", "depth")
+
+    def __init__(self, kind: str, key, name: str, decoy: bool, parent: AxisNode | None) -> None:
+        self.kind = kind          # "group", "protein" or "residue"
+        self.key = key
+        self.name = name
+        self.decoy = decoy
+        self.parent = parent
+        self.children: list[AxisNode] = []
+        self.open = kind == "group"   # proteins start closed
+        self.depth = 0 if parent is None else parent.depth + 1
+        if parent is not None:
+            parent.children.append(self)
+
+    def path(self) -> list[AxisNode]:
+        """The nodes above this one, the biggest first."""
+        path, node = [], self.parent
+        while node is not None:
+            path.insert(0, node)
+            node = node.parent
+        return path
+
+    def walk(self):
+        """This node and everything under it."""
+        yield self
+        for child in self.children:
+            yield from child.walk()
+
+    def protein(self) -> str | None:
+        """The protein this node is or belongs to (None for a group)."""
+        if self.kind == "protein":
+            return self.key
+        return self.key.protein if self.kind == "residue" else None
+
+    def group(self) -> str:
+        """The name of the nearest group above this node, or ""."""
+        node = self.parent
+        while node is not None and node.kind != "group":
+            node = node.parent
+        return node.name if node is not None else ""
+
+
+def _build_tree(proteins: list[str], decoy: dict[str, bool], sections: dict[str, str] | None,
+                parents: dict[str, str], residues: dict[str, list]) -> list[AxisNode]:
+    """The top nodes of the tree. proteins are in axis order (sections stay
+    together), sections names the group of each protein, parents the bigger
+    group of a group, residues the ResidueIds of each protein sorted by
+    position. Targets and decoys never share a group."""
+    top: list[AxisNode] = []
+    groups: dict[tuple[bool, str], AxisNode] = {}
+
+    def group(name: str, is_decoy: bool) -> AxisNode:
+        if (is_decoy, name) not in groups:
+            bigger = parents.get(name)
+            parent = group(bigger, is_decoy) if bigger else None
+            node = groups[(is_decoy, name)] = AxisNode("group", name, name, is_decoy, parent)
+            if parent is None:
+                top.append(node)
+        return groups[(is_decoy, name)]
+
+    for p in proteins:
+        is_decoy = decoy.get(p, False)
+        parent = group(sections[p], is_decoy) if sections and p in sections else None
+        node = AxisNode("protein", p, p, is_decoy, parent)
+        if parent is None:
+            top.append(node)
+        for r in residues.get(p, ()):
+            AxisNode("residue", r, str(r.pos), is_decoy, node)
+    return top
+
+
+def _slot_labels(node: AxisNode) -> tuple[str, str]:
+    """The column and the row name of a node. A closed group gets a "+" in
+    front, so it can be told apart from a protein."""
+    if node.kind == "residue":
+        return str(node.key.pos)[:COL_W], f"{short_accession(node.key.protein)}:{node.key.pos}"[:ROW_W]
+    name = "+" + node.name if node.kind == "group" else node.name
+    return name[:COL_W], name[:ROW_W]
+
+
+# -----------------------------------------------------------------------------
 # The application window
 # -----------------------------------------------------------------------------
 
@@ -326,23 +496,45 @@ class MatrixApp(tk.Tk):
         self.geometry("1200x800")
         self.minsize(700, 450)
 
-        # The loaded data. Axis items are protein names, or residues in residue mode.
-        self._level: str = "protein"
-        self._proteins: list = []
-        self._sparse: dict[tuple, float] = {}
-        self._decoy: dict = {}
-        self._section: dict | None = None
+        # The loaded data: the best score of every protein pair and of every
+        # residue pair (empty without residue positions in the CSV), each
+        # once more as arrays (row, column, score) of protein or residue
+        # numbers, because numpy is much faster on these
+        self._prot_sparse: dict[tuple, float] = {}
+        self._res_sparse: dict[tuple, float] = {}
+        self._prot_index: dict[str, int] = {}
+        self._res_index: dict = {}
+        self._res_protein: np.ndarray = np.zeros(0, dtype=np.int64)   # protein number of each residue
+        self._prot_links = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0))
+        self._res_links = (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0))
         self._seqs: dict[str, str] = {}
         self._seq_index: dict[str, str] = {}   # self._seqs, also keyed by bare accession
-        self._split: int = 0              # index of the first decoy
+
+        # The axis tree and what of it is on the axes right now: the slots
+        # are the nodes that stand on the axes, in order (see _rebuild_axis)
+        self._tree: list[AxisNode] = []
+        self._slots: list[AxisNode] = []
+        self._slot_paths: list[list[AxisNode]] = []   # the open nodes above each slot
+        self._band_levels: int = 0        # rows of group/protein names above the slot names
+        self._uniform: bool = True        # all slots are proteins, or all are residues
+        self._has_residue_slots: bool = False
+        self._split: int = 0              # index of the first decoy slot
         self._col_labels: list[str] = []
         self._row_labels: list[str] = []
-        self._item_index: dict = {}
-        # Every crosslink once more as arrays (row item, column item, score),
-        # in the same order as self._sparse. numpy is much faster on these.
+        # Every crosslink that the slots show, as (row slot, column slot,
+        # score): protein pairs between closed proteins, residue pairs where
+        # at least one protein is open
         self._link_rows: np.ndarray = np.zeros(0, dtype=np.int64)
         self._link_cols: np.ndarray = np.zeros(0, dtype=np.int64)
         self._link_scores: np.ndarray = np.zeros(0)
+
+        # Annotations from UniProt: {protein: [[type, start, end, text], ...]},
+        # None until they are first switched on
+        self._features: dict[str, list] | None = None
+        self._features_loading: bool = False
+        self._shown_features: list[str] = []
+        self._slot_tracks: np.ndarray = np.zeros((0, 0), dtype=bool)    # (feature type, slot)
+        self._block_tracks: np.ndarray = np.zeros((0, 0), dtype=bool)   # (feature type, block)
 
         # Blocks. All drawing code works on blocks instead of single items.
         # Without zooming out every block holds exactly one item.
@@ -485,9 +677,6 @@ class MatrixApp(tk.Tk):
         self._fasta_var = tk.StringVar()
         field(data, 1, "FASTA", tk.Entry(data, textvariable=self._fasta_var, width=10),
               tk.Button(data, text="…", width=2, command=self._browse_fasta))
-        self._level_var = tk.StringVar(value="protein")
-        field(data, 2, "Level", ttk.Combobox(data, textvariable=self._level_var, width=10,
-                                             state="readonly", values=["protein", "residue"]))
         self._order_var = tk.StringVar(value="confidence")
         field(data, 3, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
                                              state="readonly", values=ORDER_MODES))
@@ -539,6 +728,15 @@ class MatrixApp(tk.Tk):
             btn.pack(side=tk.LEFT, padx=(0, 2))
             self._zoom_to_btns[target] = btn
         field(display, 4, "Zoom to", zoom_to)
+        # Show: open or close every group and protein at once (single ones
+        # are opened by clicking their name, closed by clicking their band)
+        show = tk.Frame(display)
+        for k, level in enumerate(_SHOW_LEVELS):
+            tk.Button(show, text=level, padx=1,
+                      command=lambda lv=level: self._show_level(lv)).grid(row=0, column=k, sticky="ew")
+            show.columnconfigure(k, weight=1)
+        tk.Label(display, text="Show").grid(row=8, column=0, sticky="w", pady=(4, 0))
+        show.grid(row=9, column=0, columnspan=3, sticky="ew", pady=1)
         self._agg_method_var = tk.StringVar(value="Geometric Mean")
         field(display, 5, "Aggregate", ttk.Combobox(
             display, textvariable=self._agg_method_var, width=10, state="readonly",
@@ -564,6 +762,21 @@ class MatrixApp(tk.Tk):
             self._quad_vars[name] = var
             tk.Checkbutton(quadrants, text=name, variable=var).grid(
                 row=k // 2, column=k % 2, sticky="w", padx=(0, 12))
+
+        # Annotations: UniProt features as coloured tracks along residue axes
+        annotations = group("Annotations")
+        self._feature_vars: dict[str, tk.BooleanVar] = {}
+        for k, name in enumerate(FEATURE_TYPES):
+            var = tk.BooleanVar(value=False)
+            var.trace_add("write", lambda *_: self._on_features_change())
+            self._feature_vars[name] = var
+            cell = tk.Frame(annotations)
+            cell.grid(row=k // 2, column=k % 2, sticky="w", padx=(0, 6))
+            tk.Label(cell, bg=_FEATURE_COLOURS[name], width=1, height=1, bd=0).pack(side=tk.LEFT)
+            tk.Checkbutton(cell, text=name, variable=var, padx=0).pack(side=tk.LEFT)
+        self._features_var = tk.StringVar(value="shown along residue rows and columns")
+        tk.Label(annotations, textvariable=self._features_var, fg="gray", wraplength=wrap,
+                 justify=tk.LEFT).grid(row=4, column=0, columnspan=2, sticky="w")
 
         # Score cutoff: lower and upper limit on one slider
         cutoff = group("Score cutoff")
@@ -659,7 +872,14 @@ class MatrixApp(tk.Tk):
         hbar.grid(row=2, column=1, sticky="ew")
         self._mx.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
 
-        self._mx.bind("<Configure>", lambda _e: self._schedule())
+        # clicking a name opens it, clicking a band above/left of names closes
+        # it; the wheel zooms here too, around the pointer
+        self._ch_canvas.bind("<ButtonRelease-1>", lambda e: self._on_label_click(e, "col"))
+        self._rl_canvas.bind("<ButtonRelease-1>", lambda e: self._on_label_click(e, "row"))
+        for canvas in (self._ch_canvas, self._rl_canvas):
+            for wheel in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                canvas.bind(wheel, self._wheel)
+        self._mx.bind("<Configure>", lambda _e: (self._update_scrollregion(), self._schedule()))
         self._mx.bind("<MouseWheel>", self._wheel)
         self._mx.bind("<Button-4>", self._wheel)
         self._mx.bind("<Button-5>", self._wheel)
@@ -689,36 +909,52 @@ class MatrixApp(tk.Tk):
             self._pg_cache.clear()
 
     @property
+    def _band_h(self) -> int:
+        """The height of one row of group/protein names on top (and the
+        width of one on the left): room for two lines of text."""
+        return 2 * self._ch
+
+    @property
     def _section_band(self) -> int:
-        """The height of the section names on top, and the width of those
-        on the left: room for two lines of text."""
-        return 2 * self._ch if self._section is not None else 0
+        """All rows of group/protein names together, one per level of open
+        nodes above the slots."""
+        return self._band_levels * self._band_h
 
     @property
     def _name_w(self) -> int:
         """The width of the row names alone."""
         return ROW_W * self._cw + 6
 
+    @property
+    def _tracks_px(self) -> int:
+        """The room the annotation tracks take, next to the names. Only
+        there while residues are on the axes."""
+        if not self._shown_features or not self._has_residue_slots:
+            return 0
+        return len(self._shown_features) * (TRACK_PX + TRACK_GAP_PX) + TRACK_GAP_PX
+
     def _names_shown(self, overview: bool) -> bool:
-        """Whether the single item names are shown. Zoomed out into blocks
+        """Whether the single slot names are shown. Zoomed out into blocks
         they can't be read; residues keep a sparse position axis instead."""
-        return not overview or self._level == "residue"
+        return not overview or self._has_residue_slots
 
     def _headers_shown(self, overview: bool) -> bool:
         """Whether there are column headers and row labels at all. Zoomed out
-        into blocks, section names (complexes, …) are still worth
-        showing: that's where links between sections are looked at."""
-        return self._names_shown(overview) or self._section is not None
+        into blocks, group names (complexes, …) are still worth showing:
+        that's where links between groups are looked at."""
+        return self._names_shown(overview) or self._band_levels > 0
 
     def _label_sizes(self, overview: bool) -> tuple[int, int, int]:
         """(width of everything left of the matrix, height of the line under
         the column names counted from the top, height of the whole header)
-        while zoomed out into blocks or not. Section names come first, then
-        the item names if they are shown."""
+        while zoomed out into blocks or not. The group/protein names come
+        first, then the slot names if they are shown, then the annotation
+        tracks next to the matrix."""
         names = self._names_shown(overview)
-        width = self._section_band + (self._name_w if names else 0)
+        tracks = self._tracks_px
+        width = self._section_band + (self._name_w if names else 0) + tracks
         base = self._section_band + (self._slant_h if names else 0)
-        return width, base, base + self._ch // 2 + 2
+        return width, base, base + self._ch // 2 + 2 + tracks
 
     @property
     def _label_w(self) -> int:
@@ -851,11 +1087,23 @@ class MatrixApp(tk.Tk):
     def _pad(self) -> int:
         return OVERVIEW_PAD_PX if self._overview else 0
 
+    def _margins(self) -> tuple[int, int]:
+        """How far the view can be moved past the matrix edges, left/right
+        and up/down. Almost a whole view, like on a map: that way zooming
+        keeps the spot under the mouse in place even near an edge."""
+        return (max(self._pad, self._mx.winfo_width() - MIN_VISIBLE_PX),
+                max(self._pad, self._mx.winfo_height() - MIN_VISIBLE_PX))
+
     def _update_scrollregion(self) -> None:
-        size, pad = len(self._blocks) * self._cell_px, self._pad
-        self._mx.configure(scrollregion=(-pad, -pad, size + pad, size + pad))
-        self._ch_canvas.configure(scrollregion=(-pad, 0, size + pad, self._header_h))
-        self._rl_canvas.configure(scrollregion=(0, -pad, self._label_w, size + pad))
+        """Fit the scroll region to the matrix size and the view size. The
+        view keeps showing the same part of the matrix."""
+        ox, oy = self._mx.canvasx(0), self._mx.canvasy(0)
+        size = len(self._blocks) * self._cell_px
+        mx, my = self._margins()
+        self._mx.configure(scrollregion=(-mx, -my, size + mx, size + my))
+        self._ch_canvas.configure(scrollregion=(-mx, 0, size + mx, self._header_h))
+        self._rl_canvas.configure(scrollregion=(0, -my, self._label_w, size + my))
+        self._scroll_to(ox, oy)
 
     def _yscroll(self, *args) -> None:
         self._mx.yview(*args)
@@ -878,10 +1126,12 @@ class MatrixApp(tk.Tk):
 
     def _scroll_to(self, ox: float, oy: float) -> None:
         """Move the view so that pixel (ox, oy) of the whole matrix sits in
-        the top-left corner. Tk keeps the view inside the matrix by itself."""
-        size, pad = len(self._blocks) * self._cell_px, self._pad
+        the top-left corner. Tk keeps the view inside the scroll region
+        (the matrix plus _margins) by itself."""
+        size = len(self._blocks) * self._cell_px
+        mx, my = self._margins()
         if size:
-            fx, fy = (ox + pad) / (size + 2 * pad), (oy + pad) / (size + 2 * pad)
+            fx, fy = (ox + mx) / (size + 2 * mx), (oy + my) / (size + 2 * my)
             self._mx.xview_moveto(fx)
             self._ch_canvas.xview_moveto(fx)
             self._mx.yview_moveto(fy)
@@ -971,7 +1221,6 @@ class MatrixApp(tk.Tk):
 
     def _load(self) -> None:
         csv = self._csv_var.get().strip()
-        level = self._level_var.get()
         order = self._order_var.get()
         fasta = self._fasta_var.get().strip() or None
         locations = self._locations_var.get()
@@ -994,84 +1243,316 @@ class MatrixApp(tk.Tk):
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     seqs = read_fasta(fasta) if fasta else None
-                    if level == "residue":
-                        items, sparse, decoy = build_residue_matrix(csv, n=None)   # always all residues
+                    proteins, prot_sparse, decoy = build_matrix(csv, n=None)   # always all proteins
+                    proteins, sections = sort_proteins(proteins, decoy, order, seqs, locations)
+                    parents = complex_hierarchy(set(sections.values())) if order == "complex" and sections else {}
+                    # the residues, so that proteins can be opened
+                    try:
+                        residues, res_sparse, res_decoy = build_residue_matrix(csv, n=None)
                         if seqs:
                             # with a FASTA, every residue of the loaded proteins is shown,
                             # not only the crosslinked ones
-                            items, decoy = add_unlinked_residues(items, decoy, seqs)
-                        items, section = sort_residues(items, decoy, order, seqs, locations)
-                    else:
-                        items, sparse, decoy = build_matrix(csv, n=None)   # always all proteins
-                        items, section = sort_proteins(items, decoy, order, seqs, locations)
+                            residues, res_decoy = add_unlinked_residues(residues, res_decoy, seqs)
+                    except ValueError:
+                        residues, res_sparse = [], {}
+                        warnings.warn("no residue positions in the CSV, proteins can't be opened")
                     notes = [str(w.message) for w in caught]
-                self.after(0, lambda: self._on_loaded(items, sparse, decoy, section, seqs, level, notes))
+                data = dict(proteins=proteins, prot_sparse=prot_sparse, decoy=decoy, sections=sections,
+                            parents=parents, residues=residues, res_sparse=res_sparse, seqs=seqs)
+                self.after(0, lambda: self._on_loaded(data, notes))
             except Exception as exc:
                 msg = str(exc)
                 self.after(0, lambda: self._on_error(msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_loaded(self, items: list, sparse: dict, decoy: dict, section: dict | None,
-                   seqs: dict[str, str] | None, level: str, notes: list[str] = ()) -> None:
-        self._level = level
-        self._proteins = items
-        self._sparse = sparse
-        self._decoy = decoy
-        self._section = section
-        self._seqs = seqs or {}
+    def _on_loaded(self, data: dict, notes: list[str] = ()) -> None:
+        """Take over what the load worker read (see _load): build the axis
+        tree and the link arrays, then show the proteins."""
+        proteins, decoy = data["proteins"], data["decoy"]
+        self._prot_sparse, self._res_sparse = data["prot_sparse"], data["res_sparse"]
+        self._seqs = data["seqs"] or {}
         self._seq_index = seq_index(self._seqs)   # also reachable by bare accession
-        if level == "residue":
-            self._col_labels = [str(r.pos)[:COL_W] for r in items]
-            self._row_labels = [f"{short_accession(r.protein)}:{r.pos}"[:ROW_W] for r in items]
-        else:
-            self._col_labels = [p[:COL_W] for p in items]
-            self._row_labels = [p[:ROW_W] for p in items]
-        self._split = next((i for i, p in enumerate(items) if decoy.get(p, False)), len(items))
-        scores = list(sparse.values())
-        self._min_score = min(scores) if scores else 0.0
-        self._max_score = max(scores) if scores else 1.0
-        self._score_sorted = np.sort(scores) if scores else np.array([])
-        self._item_index = {p: i for i, p in enumerate(items)}
-        index = self._item_index
-        self._link_rows = np.array([index[a] for a, _ in sparse], dtype=np.int64)
-        self._link_cols = np.array([index[b] for _, b in sparse], dtype=np.int64)
-        self._link_scores = np.array(scores, dtype=float)
+
+        by_protein: dict[str, list] = {}
+        for r in data["residues"]:
+            by_protein.setdefault(r.protein, []).append(r)
+        for rs in by_protein.values():
+            rs.sort(key=lambda r: r.pos)
+        self._tree = _build_tree(proteins, decoy, data["sections"], data["parents"], by_protein)
+
+        # numbers for proteins and residues, and the links between them as arrays
+        self._prot_index = {p: i for i, p in enumerate(proteins)}
+        residues = [n.key for top in self._tree for n in top.walk() if n.kind == "residue"]
+        self._res_index = {r: i for i, r in enumerate(residues)}
+        self._res_protein = np.array([self._prot_index[r.protein] for r in residues], dtype=np.int64)
+
+        def arrays(sparse: dict, index: dict):
+            return (np.array([index[a] for a, _ in sparse], dtype=np.int64),
+                    np.array([index[b] for _, b in sparse], dtype=np.int64),
+                    np.array(list(sparse.values()), dtype=float))
+        self._prot_links = arrays(self._prot_sparse, self._prot_index)
+        self._res_links = arrays(self._res_sparse, self._res_index)
+
+        scores = np.concatenate([self._prot_links[2], self._res_links[2]])
+        self._min_score = float(scores.min()) if len(scores) else 0.0
+        self._max_score = float(scores.max()) if len(scores) else 1.0
+        # colours are measured against the scores of the level on screen (see _rebuild_axis)
+        self._score_sorted = np.sort(self._prot_links[2])
         self._label_cache.clear()
         self._slant_cache.clear()
         self._vname_cache.clear()
-        self._measure_col_labels(self._col_labels)
-        self._clear_selection()   # it pointed into the old data
+        # measured once over every name that can come up, so the header
+        # doesn't change size when something is opened
+        self._measure_col_labels([_slot_labels(n)[0] for top in self._tree for n in top.walk()])
         self._cut_lo, self._cut_hi = self._min_score, self._max_score
         self._cutoff_slider.set_bounds(self._cut_lo, self._cut_hi)
-        self._update_cutoff_label()
-        self._runs = self._find_runs()
-        self._recompute_blocks()
-        self._zoom_min = self._find_zoom_min()
-        self._zoom.configure(from_=self._zoom_min)
-        if self._zoom_value < self._zoom_min:   # the new matrix needs fewer block steps
-            self._on_zoom(str(self._zoom_min))
-            self._zoom.set(self._zoom_min)
-        for target, btn in self._zoom_to_btns.items():
-            btn.configure(state=tk.NORMAL if self._zoom_region(target) else tk.DISABLED)
+        if self._features is not None:
+            self._features = None   # the new proteins need their own
+            self._load_features()
 
-        unit = "residues" if level == "residue" else "proteins"
-        status = f"Loaded — {self._split} targets · {len(items) - self._split} decoys · {len(sparse)} links"
+        self._show_level("Protein")   # also moves the view to the top-left corner
+
+        n_targets = sum(1 for p in proteins if not decoy.get(p, False))
+        status = (f"Loaded — {n_targets} target · {len(proteins) - n_targets} decoy proteins · "
+                  f"{len(self._prot_sparse)} protein links · {len(self._res_sparse)} residue links")
         if notes:
             # e.g. CSV protein names the FASTA didn't recognise — shortened so
             # one long list of names can't push the rest of the panel off screen
             shortened = [n if len(n) <= 220 else n[:220] + "…" for n in notes]
             status += "\n⚠ " + "\n⚠ ".join(shortened)
         self._status_var.set(status)
-        self._info_var.set(f"{len(items)} {unit}")
         self._load_btn.configure(state=tk.NORMAL)
-        # the new data can have sections or a level the old one didn't
+
+    # -------------------------------------------------------------------------
+    # Opening and closing parts of the axis tree
+    #
+    # Clicking a name on an axis opens that group or protein, clicking one of
+    # the bands above (or left of) the names closes it again. The "Show"
+    # buttons set the whole tree at once. Afterwards the slots, the links
+    # they show and everything that depends on them are worked out again.
+    # -------------------------------------------------------------------------
+
+    def _show_level(self, level: str) -> None:
+        """Open or close every node: "Top" closes the biggest groups,
+        "Complex" the smallest ones (those without groups inside), "Protein"
+        shows every protein and "Residue" every residue."""
+        for top in self._tree:
+            for node in top.walk():
+                if node.kind == "protein":
+                    node.open = level == "Residue"
+                elif node.kind == "group":
+                    if level == "Top":
+                        node.open = node.depth > 0
+                    elif level == "Complex":
+                        node.open = any(c.kind == "group" for c in node.children)
+                    else:
+                        node.open = True
+        self._apply_axis()
+        self._scroll_to(-self._pad, -self._pad)
+
+    def _on_label_click(self, event: tk.Event, axis: str) -> None:
+        """A click on the column headers or the row labels: on a band, close
+        that group or protein; on a name, open it."""
+        if not self._blocks or self._dragging:
+            return
+        if axis == "col":
+            along, across = self._ch_canvas.canvasx(event.x), event.y
+        else:
+            along, across = self._rl_canvas.canvasy(event.y), event.x
+        block = int(along // self._cell_px)
+        if not 0 <= block < len(self._blocks):
+            return
+        start, end = self._blocks[block]
+        if across < self._section_band:
+            path = self._slot_paths[start]
+            level = int(across // self._band_h)
+            if level < len(path):
+                self._set_open(path[level], False)
+        elif end - start == 1 and self._names_shown(self._overview):
+            node = self._slots[start]
+            if node.children:
+                self._set_open(node, True)
+            elif node.kind == "protein":
+                self._status_var.set(f"{node.name}: no residue positions to open")
+
+    def _set_open(self, node: AxisNode, is_open: bool) -> None:
+        """Open or close one node. Its first row/column stays where it is on
+        screen."""
+        def first_slot() -> int:
+            return next(k for k, s in enumerate(self._slots) if s is node or node in self._slot_paths[k])
+        k = first_slot()
+        screen_x = self._pixel_of(k) - self._mx.canvasx(0)
+        screen_y = self._pixel_of(k) - self._mx.canvasy(0)
+        node.open = is_open
+        self._apply_axis()
+        k = first_slot()
+        self._scroll_to(self._pixel_of(k) - screen_x, self._pixel_of(k) - screen_y)
+
+    def _rebuild_axis(self) -> None:
+        """Work out the slots (the nodes standing on the axes), their names
+        and bands, and which crosslinks they show."""
+        slots: list[AxisNode] = []
+
+        def walk(nodes: list[AxisNode]) -> None:
+            for node in nodes:
+                if node.open and node.children:
+                    walk(node.children)
+                else:
+                    slots.append(node)
+        walk(self._tree)
+        self._slots = slots
+        self._slot_paths = [node.path() for node in slots]
+        self._band_levels = max((node.depth for node in slots), default=0)
+        kinds = {node.kind for node in slots}
+        self._uniform = kinds in ({"protein"}, {"residue"})
+        self._has_residue_slots = "residue" in kinds
+        self._split = next((k for k, node in enumerate(slots) if node.decoy), len(slots))
+        labels = [_slot_labels(node) for node in slots]
+        self._col_labels = [c for c, _ in labels]
+        self._row_labels = [r for _, r in labels]
+
+        # Which slot every protein and every residue is in. An open protein
+        # has no slot of its own (-1): its residues have one each.
+        prot_slot = np.full(len(self._prot_index), -1, dtype=np.int64)
+        res_slot = np.full(len(self._res_index), -1, dtype=np.int64)
+        for k, node in enumerate(slots):
+            if node.kind == "residue":
+                res_slot[self._res_index[node.key]] = k
+            else:
+                for n in node.walk():
+                    if n.kind == "protein":
+                        prot_slot[self._prot_index[n.key]] = k
+        prot_open = prot_slot < 0
+        res_slot = np.where(res_slot >= 0, res_slot, prot_slot[self._res_protein])
+
+        # protein links between closed proteins, residue links where at
+        # least one of the two proteins is open
+        pr, pc, ps = self._prot_links
+        rr, rc, rs = self._res_links
+        use_p = ~(prot_open[pr] | prot_open[pc])
+        use_r = prot_open[self._res_protein[rr]] | prot_open[self._res_protein[rc]]
+        self._link_rows = np.concatenate([prot_slot[pr[use_p]], res_slot[rr[use_r]]])
+        self._link_cols = np.concatenate([prot_slot[pc[use_p]], res_slot[rc[use_r]]])
+        self._link_scores = np.concatenate([ps[use_p], rs[use_r]])
+        # the colours follow the scores of the level on screen
+        self._score_sorted = np.sort(rs if kinds == {"residue"} else ps if kinds == {"protein"}
+                                     else self._link_scores)
+        self._slot_tracks = self._tracks_for(slots)
+
+    def _apply_axis(self) -> None:
+        """After the slots changed: blocks, zoom range, layout and the score
+        distribution follow. The selection is cleared."""
+        self._rebuild_axis()
+        self._clear_selection()
+        self._runs = self._find_runs()
+        self._recompute_blocks()
+        self._zoom_min = self._find_zoom_min()
+        self._zoom.configure(from_=self._zoom_min)
+        if self._zoom_value < self._zoom_min:   # the new axes need fewer block steps
+            self._on_zoom(str(self._zoom_min))
+            self._zoom.set(self._zoom_min)
+        for target, btn in self._zoom_to_btns.items():
+            btn.configure(state=tk.NORMAL if self._zoom_region(target) else tk.DISABLED)
+        self._update_distribution()
+        self._update_cutoff_label()
+        n_res = sum(1 for node in self._slots if node.kind == "residue")
+        self._info_var.set(f"{len(self._slots)} rows ({n_res} residues)")
+        # the bands and names can take a different amount of room now
         self._apply_header_layout()
         self._update_scrollregion()
-        for view in (self._mx.xview_moveto, self._mx.yview_moveto,
-                     self._ch_canvas.xview_moveto, self._rl_canvas.yview_moveto):
-            view(0)
         self._schedule()
+
+    # -------------------------------------------------------------------------
+    # Annotation tracks
+    #
+    # UniProt features (helices, binding sites, ...) of the chosen types are
+    # drawn as thin coloured strips along every residue row and column. They
+    # are fetched in the background the first time a type is switched on.
+    # -------------------------------------------------------------------------
+
+    def _on_features_change(self) -> None:
+        self._shown_features = [name for name, var in self._feature_vars.items() if var.get()]
+        if self._shown_features and self._features is None:
+            self._load_features()
+            return
+        self._update_tracks()
+
+    def _load_features(self) -> None:
+        """Fetch the features of every loaded protein in the background."""
+        if self._features_loading or not self._prot_index:
+            return
+        self._features_loading = True
+        self._features_var.set("fetching from UniProt…")
+        proteins = list(self._prot_index)
+
+        def worker() -> None:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                features = features_for(proteins)
+            note = str(caught[0].message) if caught else None
+            self.after(0, lambda: self._on_features_loaded(features, note))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_features_loaded(self, features: dict[str, list], note: str | None) -> None:
+        self._features_loading = False
+        self._features = features
+        n = sum(1 for f in features.values() if f)
+        self._features_var.set(note or f"{n} of {len(features)} proteins annotated; "
+                                        "shown along residue rows and columns")
+        self._update_tracks()
+
+    def _update_tracks(self) -> None:
+        if not self._slots:
+            return
+        self._slot_tracks = self._tracks_for(self._slots)
+        self._block_tracks = self._tracks_per_block()
+        self._apply_header_layout()   # the tracks take room next to the names
+        self._update_scrollregion()
+        self._schedule()
+
+    def _tracks_for(self, slots: list[AxisNode]) -> np.ndarray:
+        """For each shown feature type and each slot: whether that residue
+        lies inside such a feature. Proteins and groups never do."""
+        tracks = np.zeros((len(self._shown_features), len(slots)), dtype=bool)
+        if self._features is None:
+            return tracks
+        covered: dict[tuple[str, str], np.ndarray] = {}   # (protein, type) -> one bool per position
+
+        def coverage(protein: str, kind: str) -> np.ndarray:
+            if (protein, kind) not in covered:
+                spans = [(f[1], f[2]) for f in self._features.get(protein, ()) if f[0] == kind]
+                mask = np.zeros(max((e for _, e in spans), default=0) + 1, dtype=bool)
+                for start, end in spans:
+                    mask[start:end + 1] = True
+                covered[(protein, kind)] = mask
+            return covered[(protein, kind)]
+
+        for t, kind in enumerate(self._shown_features):
+            for k, node in enumerate(slots):
+                if node.kind == "residue":
+                    mask = coverage(node.key.protein, kind)
+                    tracks[t, k] = node.key.pos < len(mask) and mask[node.key.pos]
+        return tracks
+
+    def _tracks_per_block(self) -> np.ndarray:
+        """_slot_tracks per block: a block has a feature if any of its slots has it."""
+        if not self._blocks or not self._slot_tracks.size:
+            return np.zeros((len(self._shown_features), len(self._blocks)), dtype=bool)
+        starts = [s for s, _ in self._blocks]
+        return np.logical_or.reduceat(self._slot_tracks, starts, axis=1)
+
+    def _features_at(self, node: AxisNode) -> list[str]:
+        """The features a residue lies in, as short texts."""
+        if self._features is None or node.kind != "residue":
+            return []
+        pos = node.key.pos
+        out = []
+        for kind, start, end, text in self._features.get(node.key.protein, ()):
+            if start <= pos <= end:
+                where = f"{start}" if start == end else f"{start}-{end}"
+                out.append(f"{kind} {where}" + (f" ({text})" if text else ""))
+        return out
 
     def _on_error(self, msg: str) -> None:
         self._load_btn.configure(state=tk.NORMAL)
@@ -1124,9 +1605,9 @@ class MatrixApp(tk.Tk):
 
     def _colour_caption(self, folded: bool | None = None, merged: bool | None = None) -> str:
         """What the cell colours stand for, for the colour legend. Screen
-        settings unless folded/merged are given (the export never merges)."""
+        settings unless folded/merged are given (the export has no blocks)."""
         folded = self._folded if folded is None else folded
-        merged = self._block_size > 1 if merged is None else merged
+        merged = (self._block_size > 1 or not self._uniform) if merged is None else merged
         if not (folded or merged):
             what = "score"
         elif self._agg_method == "count":
@@ -1164,7 +1645,7 @@ class MatrixApp(tk.Tk):
 
     def _update_legend(self) -> None:
         """Redraw the colour legend in the control panel."""
-        if not self._proteins or self._pil_lf is None:
+        if not self._slots or self._pil_lf is None:
             return
         img = self._legend_image(SIDEBAR_W - 40, self._colour_ref, self._colour_caption())
         self._legend_photo = ImageTk.PhotoImage(img)
@@ -1205,6 +1686,7 @@ class MatrixApp(tk.Tk):
         self._group_links()
         self._reduce_block_scores()
         self._update_cutoff_label()
+        self._update_distribution()
         self._pg_cache.clear()
         self._schedule()
         if self._selected is not None:
@@ -1222,11 +1704,21 @@ class MatrixApp(tk.Tk):
             self._select_block(*self._selected)   # update the text for the selected cell
 
     def _reset_cutoff(self) -> None:
-        if not self._sparse:
+        if not len(self._score_sorted) and not self._prot_index:
             return
         self._cutoff_slider.set_bounds(self._min_score, self._max_score)
         self._on_cutoff(self._min_score, self._max_score)
         self._on_cutoff_release(self._min_score, self._max_score)
+
+    def _update_distribution(self) -> None:
+        """The score distribution over the cutoff slider: the crosslinks on
+        the axes in the quadrants that are switched on, TT as targets and
+        the rest (with at least one decoy side) as decoys."""
+        rows, cols, scores = self._link_rows, self._link_cols, self._link_scores
+        quadrant = 2 * (rows >= self._split) + (cols >= self._split)
+        shown = np.array([self._quad_shown[q] for q in _QUADRANTS])[quadrant]
+        self._cutoff_slider.set_distribution(scores[shown & (quadrant == 0)],
+                                             scores[shown & (quadrant > 0)])
 
     def _update_cutoff_label(self) -> None:
         shown = int(self._shown_links().sum())
@@ -1248,7 +1740,9 @@ class MatrixApp(tk.Tk):
     def _on_zoom(self, value: str, anchor: tuple[float, float] | None = None) -> None:
         """Called by the zoom slider and by the mouse wheel. The spot under
         `anchor` (in canvas pixels; the middle of the view if not given)
-        stays where it is while everything around it grows or shrinks."""
+        stays where it is while everything around it grows or shrinks. The
+        wheel may move the view past the matrix edges for that (see
+        _margins); the slider stays inside them where it can."""
         v = int(float(value))
         if v == self._zoom_value:
             return   # the slider only reports what the wheel has already done
@@ -1275,7 +1769,15 @@ class MatrixApp(tk.Tk):
                 # the selected items now sit in other blocks
                 self._select_block(*(self._item_to_block[i] for i in self._selected_items))
         self._update_scrollregion()
-        self._scroll_to(self._pixel_of(item_x) - ax, self._pixel_of(item_y) - ay)
+        ox, oy = self._pixel_of(item_x) - ax, self._pixel_of(item_y) - ay
+        if anchor is None:
+            # the slider: like before the view could go past the edges,
+            # don't show empty space next to the matrix where it can be helped
+            size, pad = len(self._blocks) * self._cell_px, self._pad
+            w, h = self._mx.winfo_width(), self._mx.winfo_height()
+            ox = max(-pad, min(ox, size + pad - w))
+            oy = max(-pad, min(oy, size + pad - h))
+        self._scroll_to(ox, oy)
 
     @property
     def _headers_hidden(self) -> bool:
@@ -1340,14 +1842,13 @@ class MatrixApp(tk.Tk):
         return blocks * max(v, CELL_PX_MIN)
 
     def _find_runs(self) -> list[tuple[int, int]]:
-        """The sections in axis order, also cut at the target/decoy line.
-        Blocks are built from these (see _blocks_for)."""
-        items, section, split = self._proteins, self._section, self._split
+        """Stretches of slots under the same node (the residues of one
+        protein, the proteins of one group), also cut at the target/decoy
+        line. Blocks are built from these (see _blocks_for)."""
+        slots, split = self._slots, self._split
         runs, start = [], 0
-        for j in range(1, len(items) + 1):
-            if (j == len(items) or j == split
-                    or (section is not None
-                        and section.get(items[j], "") != section.get(items[start], ""))):
+        for j in range(1, len(slots) + 1):
+            if j == len(slots) or j == split or slots[j].parent is not slots[start].parent:
                 runs.append((start, j))
                 start = j
         return runs
@@ -1357,7 +1858,7 @@ class MatrixApp(tk.Tk):
         CELL_PX_MIN, and further for big matrices, until the whole matrix
         fits into ZOOM_OUT_FIT_PX or blocks can't get any bigger (one block
         for the targets and one for the decoys)."""
-        n = len(self._proteins)
+        n = len(self._slots)
         longest = max(self._split, n - self._split, 1)
         v = CELL_PX_MIN - BLOCK_ZOOM_STEPS
         while self._extent_px(v, 0, n) > ZOOM_OUT_FIT_PX and self._block_size_for(v) < longest:
@@ -1368,7 +1869,7 @@ class MatrixApp(tk.Tk):
         """The items (row start, row end, column start, column end) that
         `target` covers: one quadrant, or for "All" the box around all
         quadrants that are switched on. None if it holds no items."""
-        n, split = len(self._proteins), self._split
+        n, split = len(self._slots), self._split
         sides = {"T": (0, split), "D": (split, n)}
         names = [target] if target != "All" else [q for q in _QUADRANTS if self._quad_shown[q]]
         boxes = [(*sides[q[0]], *sides[q[1]]) for q in names]
@@ -1428,7 +1929,7 @@ class MatrixApp(tk.Tk):
         """The opposite of _item_at."""
         if not self._blocks:
             return 0.0
-        block = self._item_to_block[min(int(item), len(self._proteins) - 1)]
+        block = self._item_to_block[min(int(item), len(self._slots) - 1)]
         start, end = self._blocks[block]
         return (block + (item - start) / (end - start)) * self._cell_px
 
@@ -1456,12 +1957,13 @@ class MatrixApp(tk.Tk):
         self._schedule()
 
     def _recompute_blocks(self) -> None:
-        n, split, bs = len(self._proteins), self._split, self._block_size
+        n, split, bs = len(self._slots), self._split, self._block_size
         blocks = self._blocks_for(bs)
 
         self._blocks = blocks
         self._item_to_block = [bi for bi, (s, e) in enumerate(blocks) for _ in range(s, e)]
         self._split_block = self._item_to_block[split] if 0 <= split < n else len(blocks)
+        self._block_tracks = self._tracks_per_block()
         self._group_links()
         self._reduce_block_scores()
 
@@ -1483,12 +1985,14 @@ class MatrixApp(tk.Tk):
         """Turn the crosslinks of every cell into the one value it shows: a
         score, or with "Count" the number of crosslinks."""
         scores, starts = self._group_scores, self._group_starts
-        # folded, even a single cell can hold two crosslinks (both directions)
-        combined = self._block_size > 1 or self._folded
+        # folded, even a single cell can hold two crosslinks (both
+        # directions), and so can a closed group or a closed protein next to
+        # residues
+        combined = self._merges_links
         if combined:
             values = _aggregate_groups(scores, starts, self._agg_method)
         else:
-            values = scores   # one item per block, so a cell holds exactly one crosslink
+            values = scores   # one slot of one kind per block, so a cell holds exactly one crosslink
         self._cell_scores = np.array(values, dtype=float)
         if combined and self._agg_method in ("count", "rss"):
             # counts aren't scores, and a root sum of squares grows with the
@@ -1499,6 +2003,11 @@ class MatrixApp(tk.Tk):
             self._colour_ref = self._score_sorted
         self._cell_rgb = self._colours_for(self._cell_scores)
         self._update_legend()
+
+    @property
+    def _merges_links(self) -> bool:
+        """Whether a cell on screen can hold more than one crosslink."""
+        return self._block_size > 1 or self._folded or not self._uniform
 
     def _cell_at(self, rb: int, cb: int) -> tuple[float, int] | None:
         """The score shown in the cell at (row block, column block) and how
@@ -1545,55 +2054,78 @@ class MatrixApp(tk.Tk):
         self._selected = (rb, cb)
         self._sel_token += 1
         token = self._sel_token
-        row_items = self._proteins[slice(*self._blocks[rb])]
-        col_items = self._proteins[slice(*self._blocks[cb])]
+        row_nodes = self._slots[slice(*self._blocks[rb])]
+        col_nodes = self._slots[slice(*self._blocks[cb])]
         score_line = self._score_line(rb, cb)
+        # the annotations of a single residue on either side
+        notes = [f"{side}: {'; '.join(found)}"
+                 for side, nodes in (("row", row_nodes), ("col", col_nodes))
+                 if len(nodes) == 1 and (found := self._features_at(nodes[0]))]
 
         def show(fetched: tuple | None = None) -> None:
-            sides = [self._describe_side(items, fetched[k] if fetched else None, fetched is not None)
-                     for k, items in enumerate((row_items, col_items))]
-            self._sel_info_var.set("\n".join(sides + [score_line]))
+            sides = [self._describe_side(nodes, fetched[k] if fetched else None, fetched is not None)
+                     for k, nodes in enumerate((row_nodes, col_nodes))]
+            self._sel_info_var.set("\n".join(sides + [score_line] + notes))
 
         show()
-        # UniProt only makes sense when each side is a single protein
-        if len({protein_of(it) for it in row_items}) == 1 and len({protein_of(it) for it in col_items}) == 1:
+        # UniProt only makes sense when each side is (part of) a single protein
+        row_proteins = {n.protein() for n in row_nodes}
+        col_proteins = {n.protein() for n in col_nodes}
+        if len(row_proteins) == 1 and len(col_proteins) == 1 and None not in row_proteins | col_proteins:
             def fetch() -> None:
-                fetched = tuple(self._fetch_uniprot(short_accession(protein_of(items[0])))
-                                for items in (row_items, col_items))
+                fetched = tuple(self._fetch_uniprot(short_accession(next(iter(proteins))))
+                                for proteins in (row_proteins, col_proteins))
                 self.after(0, lambda: self._sel_token == token and show(fetched))
             threading.Thread(target=fetch, daemon=True).start()
 
-    def _describe_side(self, items: list, uniprot: tuple[str, int] | None, fetched: bool) -> str:
+    def _describe_side(self, nodes: list[AxisNode], uniprot: tuple[str, int] | None,
+                       fetched: bool) -> str:
         """One line of text about the row or column side of the selection."""
-        decoys = {self._decoy.get(it, False) for it in items}
+        decoys = {n.decoy for n in nodes}
         tag = "target" if decoys == {False} else "decoy" if decoys == {True} else "mixed"
-        sections = {self._section.get(it, "") for it in items} if self._section else set()
-        section = next(iter(sections)) if len(sections) == 1 else ""
-        sec = f"  [{section}]" if section else ""
+        groups = {n.group() for n in nodes}
+        group = next(iter(groups)) if len(groups) == 1 else ""
+        sec = f"  [{group}]" if group else ""
 
         if uniprot:
             name, length = uniprot
-            acc = short_accession(protein_of(items[0]))
-            return f"{name}  ({length} aa, {tag}){sec}{self._pos_range(items)}  [{acc}]"
-        if len(items) > 1:
-            return f"{len(items)} items  (?, {tag}){sec}" if fetched else f"{len(items)} items ({tag}){sec}"
-        protein = protein_of(items[0])
-        seq = find_sequence(protein, self._seq_index)
+            acc = short_accession(nodes[0].protein())
+            return f"{name}  ({length} aa, {tag}){sec}{self._pos_range(nodes)}  [{acc}]"
+        if len(nodes) > 1:
+            return f"{len(nodes)} items  (?, {tag}){sec}" if fetched else f"{len(nodes)} items ({tag}){sec}"
+        node = nodes[0]
+        if node.kind == "group":
+            n_proteins = sum(1 for n in node.walk() if n.kind == "protein")
+            return f"{node.name}  ({n_proteins} proteins, {tag}){sec}"
+        seq = find_sequence(node.protein(), self._seq_index)
         if fetched:
             size = "?"
         elif seq is not None:
             size = f"{len(seq)} aa"
         else:
             size = "fetching…"
-        return f"{items[0]}  ({size}, {tag}){sec}"
+        return f"{node.key}  ({size}, {tag}){sec}"
 
-    def _pos_range(self, items: list) -> str:
-        if self._level != "residue":
+    def _pos_range(self, nodes: list[AxisNode]) -> str:
+        postions = sorted(n.key.pos for n in nodes if n.kind == "residue")
+        if not postions:
             return ""
-        postions = sorted(it.pos for it in items)
         if len(postions) == 1:
             return f"  pos {postions[0]}"
         return f"  pos {postions[0]}-{postions[-1]}"
+
+    def _single_pair(self, rb: int, cb: int) -> tuple[float | None, int, int] | None:
+        """For a cell between one protein and one protein, or one residue
+        and one residue: (its score or None, row slot, column slot). None
+        for every other cell, whose value is combined from several links."""
+        (r_lo, r_hi), (c_lo, c_hi) = self._blocks[rb], self._blocks[cb]
+        if r_hi - r_lo != 1 or c_hi - c_lo != 1:
+            return None
+        a, b = self._slots[r_lo], self._slots[c_lo]
+        if a.kind != b.kind or a.kind == "group":
+            return None
+        sparse = self._res_sparse if a.kind == "residue" else self._prot_sparse
+        return sparse.get((a.key, b.key)), r_lo, c_lo
 
     def _score_line(self, rb: int, cb: int) -> str:
         """The scores of the clicked cell (row→col) and of its mirror cell
@@ -1607,9 +2139,9 @@ class MatrixApp(tk.Tk):
 
     def _folded_score_line(self, rb: int, cb: int) -> str:
         """Folded, a cell holds both directions together. Between two single
-        items the two directions are listed, and the combined value only if
-        both directions are shown."""
-        single = all(e - s == 1 for s, e in (self._blocks[rb], self._blocks[cb]))
+        proteins or residues the two directions are listed, and the
+        combined value only if both directions are shown."""
+        single = self._single_pair(rb, cb) is not None
         if single and rb == cb:
             return self._direction_score(rb, cb)
         lines = []
@@ -1630,18 +2162,19 @@ class MatrixApp(tk.Tk):
         return "\n".join(lines)
 
     def _direction_score(self, rb: int, cb: int) -> str:
-        (r_lo, r_hi), (c_lo, c_hi) = self._blocks[rb], self._blocks[cb]
-        if r_hi - r_lo == 1 and c_hi - c_lo == 1:
-            score = self._sparse.get((self._proteins[r_lo], self._proteins[c_lo]))
+        pair = self._single_pair(rb, cb)
+        if pair is not None:
+            score, row, col = pair
             if score is None:
                 return "(no crosslink)"
-            if not self._quadrant_shown(r_lo, c_lo):
-                hidden = f" (hidden: {self._quadrant_of(r_lo, c_lo)} quadrant)"
+            if not self._quadrant_shown(row, col):
+                hidden = f" (hidden: {self._quadrant_of(row, col)} quadrant)"
             elif not self._in_cutoff(score):
                 hidden = " (hidden by cutoff)"
             else:
                 hidden = ""
             return f"score: {score:.4f}{hidden}"
+        r_lo, c_lo = self._blocks[rb][0], self._blocks[cb][0]
         if not self._quadrant_shown(r_lo, c_lo):
             return f"(hidden: {self._quadrant_of(r_lo, c_lo)} quadrant)"
         cell = self._cell_at(rb, cb)
@@ -1680,7 +2213,7 @@ class MatrixApp(tk.Tk):
 
     def _redraw(self) -> None:
         self._pending = False
-        if not self._proteins:
+        if not self._slots:
             return
         try:
             if not self._headers_hidden:   # hidden while zoomed out into blocks (not for residues)
@@ -1865,23 +2398,31 @@ class MatrixApp(tk.Tk):
             y = cy + (k - (len(lines) - 1) / 2) * self._ch
             draw.text((cx, y), line, font=self._pil_lf, anchor="mm", fill=fill)
 
-    def _section_name_top(self, draw: ImageDraw.ImageDraw, label: str, x0: int, x1: int) -> None:
-        """A section name above the columns x0:x1, in up to two lines, with
-        its box. The name is centred on the part that is in the picture, so
-        a section wider than the view still shows its name."""
-        band = self._section_band
-        draw.rectangle([x0, 0, x1 - 1, band - 1], outline=_SEP)
+    def _section_name_top(self, draw: ImageDraw.ImageDraw, label: str, x0: int, x1: int,
+                          level: int = 0) -> None:
+        """A group or protein name above the columns x0:x1, in up to two
+        lines, with its box, in band row `level`. The name is centred on the
+        part that is in the picture, so a band wider than the view still
+        shows its name."""
+        band = self._band_h
+        y0 = level * band
+        draw.rectangle([x0, y0, x1 - 1, y0 + band - 1], outline=_SEP)
         x0, x1 = max(x0, 0), min(x1, draw.im.size[0])
         lines = _wrap_label(label, self._pil_lf, x1 - x0 - 4)
-        self._draw_name_lines(draw, lines, (x0 + x1) / 2, band / 2, _FG)
+        self._draw_name_lines(draw, lines, (x0 + x1) / 2, y0 + band / 2, _FG)
 
-    def _section_name_left(self, img: Image.Image, label: str, y0: int, y1: int) -> None:
-        """A section name left of the rows y0:y1, in up to two lines read
-        from bottom to top, with its box. Like on top, the name is centred
-        on the part that is in the picture."""
-        ImageDraw.Draw(img).rectangle([0, y0, self._section_band - 1, y1 - 1], outline=_SEP)
+    def _section_name_left(self, img: Image.Image, label: str, y0: int, y1: int,
+                           level: int = 0) -> None:
+        """A group or protein name left of the rows y0:y1, in up to two
+        lines read from bottom to top, with its box, in band column `level`.
+        Like on top, the name is centred on the part that is in the picture."""
+        band = self._band_h
+        x0 = level * band
+        ImageDraw.Draw(img).rectangle([x0, y0, x0 + band - 1, y1 - 1], outline=_SEP)
         y0, y1 = max(y0, 0), min(y1, img.height)
-        band, length = self._section_band, y1 - y0
+        length = y1 - y0
+        if length < 1:
+            return
         key = (label, length)
         mask = self._vname_cache.get(key)
         if mask is None:
@@ -1891,22 +2432,61 @@ class MatrixApp(tk.Tk):
             lines = _wrap_label(label, self._pil_lf, length - 4)
             self._draw_name_lines(ImageDraw.Draw(flat), lines, length / 2, band / 2, 255)
             mask = self._vname_cache[key] = flat.transpose(Image.Transpose.ROTATE_90)
-        img.paste(_FG, (0, y0), mask)
+        img.paste(_FG, (x0, y0), mask)
 
-    def _section_runs(self, first_items: list, split: int):
-        """Runs of neighbouring slots with the same section name, as
-        (start, end, name). A run never crosses `split`. first_items[k] is
-        the item that stands for slot k."""
-        n = len(first_items)
+    def _band_runs(self, first_slots: list[int], level: int, split: int):
+        """Runs of neighbouring positions whose slots have the same open node
+        at band row `level`, as (start, end, node); node is None where there
+        is no node that deep. A run never crosses `split`. first_slots[k] is
+        the slot that stands for position k (the first slot of a block)."""
+        n = len(first_slots)
         has_sep = 0 < split < n
+
+        def node_at(k: int) -> AxisNode | None:
+            path = self._slot_paths[first_slots[k]]
+            return path[level] if level < len(path) else None
+
         i = 0
         while i < n:
-            label = self._section.get(first_items[i], "")
+            node = node_at(i)
             j = i + 1
-            while j < n and not (has_sep and j == split) and self._section.get(first_items[j], "") == label:
+            while j < n and not (has_sep and j == split) and node_at(j) is node:
                 j += 1
-            yield i, j, label
+            yield i, j, node
             i = j
+
+    def _draw_bands(self, img: Image.Image, first_slots: list[int], split: int,
+                    cp: int, offset: int, axis: str) -> None:
+        """The names of the open groups and proteins, one band row per
+        level, above the columns (axis "col") or left of the rows ("row").
+        Position k starts at pixel k * cp + offset along the axis."""
+        draw = ImageDraw.Draw(img)
+        limit = img.width if axis == "col" else img.height
+        for level in range(self._band_levels):
+            for i, j, node in self._band_runs(first_slots, level, split):
+                a, b = i * cp + offset, j * cp + offset
+                if node is None or b <= 0 or a >= limit:
+                    continue
+                if axis == "col":
+                    self._section_name_top(draw, node.name, a, b, level)
+                else:
+                    self._section_name_left(img, node.name, a, b, level)
+
+    def _draw_tracks(self, draw: ImageDraw.ImageDraw, masks: np.ndarray, positions,
+                     cp: int, offset: int, across: int, axis: str) -> None:
+        """The annotation tracks: for every shown feature type a strip of
+        TRACK_PX, starting `across` pixels from the top (columns) or the
+        left (rows), with the positions that have the feature coloured."""
+        for t, kind in enumerate(self._shown_features):
+            a0 = across + TRACK_GAP_PX + t * (TRACK_PX + TRACK_GAP_PX)
+            colour = _FEATURE_COLOURS[kind]
+            for k in positions:
+                if masks[t, k]:
+                    p0 = k * cp + offset
+                    if axis == "col":
+                        draw.rectangle([p0, a0, p0 + cp - 1, a0 + TRACK_PX - 1], fill=colour)
+                    else:
+                        draw.rectangle([a0, p0, a0 + TRACK_PX - 1, p0 + cp - 1], fill=colour)
 
     def _draw_col_headers(self) -> None:
         c = self._ch_canvas
@@ -1921,26 +2501,20 @@ class MatrixApp(tk.Tk):
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
 
-        # section names on top (a block never spans two sections), in two
-        # lines if one isn't enough. A section too narrow even for that gets
-        # a shortened name, or none, but the box stays so the grouping is
-        # still visible.
-        if self._section is not None:
-            first_items = [self._proteins[s] for s, _ in self._blocks]
-            for i, j, label in self._section_runs(first_items, split):
-                x0, x1 = i * cp - ox, j * cp - ox
-                if x1 > 0 and x0 < w and label:
-                    self._section_name_top(draw, label, x0, x1)
+        # group and protein names on top, one row per level. A name too
+        # narrow even for two lines gets shortened, or none, but the box
+        # stays so the grouping is still visible.
+        self._draw_bands(img, [s for s, _ in self._blocks], split, cp, -ox, "col")
         y = self._label_base   # the line under the names
 
         if has_sep:
             draw.line([(split * cp - ox, 0), (split * cp - ox, h)], fill=_SEP, width=1)
 
         if not self._names_shown(self._overview):
-            pass   # zoomed out into blocks at protein level: only the section names
+            pass   # zoomed out into blocks without residues: only the band names
         elif self._overview:
-            # Zoomed out into blocks: too many items to name one by one, so
-            # only the position of one residue per block is shown, as sparse
+            # Zoomed out into blocks: too many slots to name one by one, so
+            # only the name of one slot per block is shown, as sparse
             # ticks spaced out enough not to overlap.
             last_x = -math.inf
             for cb in cols:
@@ -1956,7 +2530,7 @@ class MatrixApp(tk.Tk):
                 draw.text((x, y - AXIS_TICK_PX - 1), label, font=font, anchor="mb", fill=_FG)
                 last_x = x + half + AXIS_TICK_GAP_PX
         else:
-            # Names going up to the right (every block is one item here).
+            # Names going up to the right (every block is one slot here).
             # Names of columns left of the view can still reach into it.
             reach = math.ceil(self._slant_w / cp)
             for cb in range(max(0, cols.start - reach), cols.stop):
@@ -1968,6 +2542,8 @@ class MatrixApp(tk.Tk):
         draw.line([(0, y), (w, y)], fill=_SEP, width=1)
         if has_sep:
             draw.text((split * cp - ox, y), "+", font=font, anchor="mm", fill=_SEP)
+        if self._tracks_px:
+            self._draw_tracks(draw, self._block_tracks, cols, cp, -ox, h - self._tracks_px, "col")
 
         self._ch_photo = ImageTk.PhotoImage(img)
         c.delete("all")
@@ -1981,22 +2557,18 @@ class MatrixApp(tk.Tk):
         n = len(self._blocks)
         split = self._split_block
         rows, _ = self._visible_blocks()
+        right = w - self._tracks_px   # where the names end; the tracks come after
 
         img = Image.new("RGB", (w, h), _BG)
         draw = ImageDraw.Draw(img)
-        # the same section names as on top, so the sections of the rows can
-        # be told apart as well
-        if self._section is not None:
-            first_items = [self._proteins[s] for s, _ in self._blocks]
-            for i, j, label in self._section_runs(first_items, split):
-                y0, y1 = i * cp - oy, j * cp - oy
-                if y1 > 0 and y0 < h and label:
-                    self._section_name_left(img, label, y0, y1)
+        # the same band names as on top, so the groups of the rows can be
+        # told apart as well
+        self._draw_bands(img, [s for s, _ in self._blocks], split, cp, -oy, "row")
         if not self._names_shown(self._overview):
-            pass   # zoomed out into blocks at protein level: only the section names
+            pass   # zoomed out into blocks without residues: only the band names
         elif self._overview:
-            # Zoomed out into blocks: show the position of one residue per
-            # block, as sparse ticks spaced out enough not to overlap.
+            # Zoomed out into blocks: show the name of one slot per block,
+            # as sparse ticks spaced out enough not to overlap.
             last_y = -math.inf
             gap = self._ch + 2
             for rb in rows:
@@ -2005,15 +2577,17 @@ class MatrixApp(tk.Tk):
                 y = rb * cp + cp // 2 - oy
                 if not label or y - gap / 2 < last_y:
                     continue
-                draw.text((w - AXIS_TICK_PX - 2, y), label, font=self._pil_lf, anchor="rm", fill=_FG)
-                draw.line([(w - AXIS_TICK_PX, y), (w, y)], fill=_SEP, width=1)
+                draw.text((right - AXIS_TICK_PX - 2, y), label, font=self._pil_lf, anchor="rm", fill=_FG)
+                draw.line([(right - AXIS_TICK_PX, y), (right, y)], fill=_SEP, width=1)
                 last_y = y + gap / 2
         else:
-            for rb in rows:   # every block is one item here
+            for rb in rows:   # every block is one slot here
                 label = self._row_labels[self._blocks[rb][0]]
                 if label:
                     img.paste(_FG, (self._section_band, rb * cp + cp // 2 - oy - self._ch),
                               self._label_image(label))
+        if self._tracks_px:
+            self._draw_tracks(draw, self._block_tracks, rows, cp, -oy, right, "row")
 
         if 0 < split < n and 0 <= split * cp - oy <= h:
             draw.line([(0, split * cp - oy), (w, split * cp - oy)], fill=_SEP, width=1)
@@ -2025,12 +2599,13 @@ class MatrixApp(tk.Tk):
     # -------------------------------------------------------------------------
     # Exporting the whole matrix as a PNG
     #
-    # Unlike the screen, the export always shows every item in its own cell
-    # (no blocks). The score cutoff still applies.
+    # Unlike the screen, the export always shows every slot in its own cell
+    # (no blocks), with the axes opened as they are on screen. The score
+    # cutoff and the quadrant checkboxes still apply.
     # -------------------------------------------------------------------------
 
     def _export(self) -> None:
-        if not self._proteins:
+        if not self._slots:
             messagebox.showerror("Export", "No data loaded.")
             return
         path = filedialog.asksaveasfilename(
@@ -2053,16 +2628,16 @@ class MatrixApp(tk.Tk):
 
     def _render_full_image(self) -> Image.Image:
         cp = min(self._cell_px, 16)
-        items = self._proteins
-        n = len(items)
+        n = len(self._slots)
         split = self._split
         has_sep = 0 < split < n
 
         font_lbl = _find_pil_font(LABEL_FONT_SIZE + 2)
         font_cell = _find_pil_font(max(6, cp - 2))
-        # every item has its own cell here, so all names are shown, even
+        # every slot has its own cell here, so all names are shown, even
         # while the screen is zoomed out into blocks
         lw, base, hh = self._label_sizes(overview=False)
+        tracks = self._tracks_px
         # the slanted names of the last columns reach past the matrix on the right
         total_w, matrix_bottom = lw + n * cp + self._slant_w, hh + n * cp
         legend_w = min(max(total_w - 8, 1), 360)
@@ -2075,13 +2650,11 @@ class MatrixApp(tk.Tk):
         for k, text in enumerate(reversed(_AXIS_TITLES)):
             draw.text((lw - 4, base - 2 - k * self._ch), text, font=font_lbl, anchor="rs", fill=_SEP)
 
-        # section names on top and on the left, then the item names going
-        # up to the right
-        if self._section is not None:
-            for i, j, label in self._section_runs(items, split):
-                if label:
-                    self._section_name_top(draw, label, lw + i * cp, lw + j * cp)
-                    self._section_name_left(img, label, hh + i * cp, hh + j * cp)
+        # group and protein names on top and on the left, then the slot
+        # names going up to the right
+        every_slot = list(range(n))
+        self._draw_bands(img, every_slot, split, cp, lw, "col")
+        self._draw_bands(img, every_slot, split, cp, hh, "row")
         y = base
         for ci, lb in enumerate(self._col_labels):
             if lb:
@@ -2096,6 +2669,11 @@ class MatrixApp(tk.Tk):
             draw.text((self._section_band + 2, hh + ri * cp + cp // 2), self._row_labels[ri],
                       font=font_lbl, anchor="lm", fill=_FG)
 
+        # annotation tracks next to the matrix
+        if tracks:
+            self._draw_tracks(draw, self._slot_tracks, every_slot, cp, lw, hh - tracks, "col")
+            self._draw_tracks(draw, self._slot_tracks, every_slot, cp, hh, lw - tracks, "row")
+
         # lines between targets and decoys
         if has_sep:
             sx, sy = lw + split * cp, hh + split * cp
@@ -2103,13 +2681,14 @@ class MatrixApp(tk.Tk):
             draw.line([(sx, 0), (sx, matrix_bottom)], fill=_SEP, width=1)
             draw.line([(lw, sy), (total_w, sy)], fill=_SEP, width=1)
 
-        # the cells themselves: every crosslink that is shown, or folded, both
-        # directions of an item pair combined in the cell below the diagonal
+        # the cells themselves: every crosslink that is shown, or where a
+        # cell holds several (folded, or a closed group or protein), their
+        # combined value
         keep = self._shown_links()
         rows, cols, scores = self._link_rows[keep], self._link_cols[keep], self._link_scores[keep]
         ref = self._score_sorted   # what the colours are measured against
-        if self._folded:
-            rows, cols, grouped, starts = _group_cells(rows, cols, scores, max(1, n), folded=True)
+        if self._folded or not self._uniform:
+            rows, cols, grouped, starts = _group_cells(rows, cols, scores, max(1, n), self._folded)
             scores = _aggregate_groups(grouped, starts, self._agg_method)
             if self._agg_method in ("count", "rss"):
                 ref = np.sort(scores)   # like on screen, see _reduce_block_scores
@@ -2125,7 +2704,7 @@ class MatrixApp(tk.Tk):
                           fill=_auto_fg(colour))
 
         # what the colours mean, under the matrix
-        caption = self._colour_caption(folded=self._folded, merged=False)
+        caption = self._colour_caption(folded=self._folded, merged=not self._uniform)
         img.paste(self._legend_image(legend_w, ref, caption), (4, matrix_bottom + 8))
         return img
 

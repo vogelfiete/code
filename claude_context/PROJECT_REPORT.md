@@ -422,3 +422,52 @@ scipy 1.18.1. Windows; Git Bash + PowerShell. When scripting the GUI headlessly:
 `order_by_go_complex(proteins, locations=False)`; `sort_proteins/sort_residues(items, decoy, mode,
 sequences=None, locations=False)`; `_OrderOptions` = (sequences, locations). `sequence` ordering is back to
 the committed algorithm (no optimal leaf ordering). Modes now: confidence, alpha, sequence, complex, size.
+
+## 13. Session 2026-11-06, later (user request: axis tree, annotations, score distribution, zoom on cursor)
+
+User asked for: zoom on cursor; click an axis protein → residues; collapse proteins → complexes, and
+subunits → bigger complex; UniProt structural annotations as colours on the axes with a menu; a score
+distribution curve over the cutoff.
+- **Axis tree (GUI):** `AxisNode` (kind group/protein/residue, key, name, decoy, parent, children, open,
+  depth) built by `_build_tree(proteins, decoy, sections, parents, residues)`. Targets and decoys never share
+  a group node. `_rebuild_axis` walks open nodes → `_slots` (replaces `_proteins`), `_slot_paths`,
+  `_band_levels` (= max slot depth), `_uniform` (all protein or all residue slots), `_split`, labels
+  (`_slot_labels`; closed group = `+name`). Links: the GUI now loads BOTH `build_matrix` and
+  `build_residue_matrix` (if the CSV has positions; else a status note) and keeps them as index arrays
+  `_prot_links`/`_res_links`; per rebuild, protein links between closed proteins + residue links where ≥1
+  protein is open are mapped to slot numbers → `_link_rows/_link_cols/_link_scores` (downstream code
+  unchanged). `_merges_links` = blocks or folded or not uniform → cells aggregate. `_score_sorted` = scores
+  of the level on screen. `_find_runs` = runs of slots with the same parent.
+  Interaction: `_on_label_click` (bound on header/row-label canvases, ButtonRelease-1): click in a band →
+  close `path[level]`; click on a single-slot name → open it. `_set_open` keeps the node's first slot at the
+  same screen position. "Show" buttons (Display rows 8/9) → `_show_level(Top|Complex|Protein|Residue)`.
+  `_apply_axis` redoes blocks, zoom range, distribution, layout. The **Level** combobox is gone (GUI only;
+  CLI keeps `--level`). Bands: one row per level (`_band_h` = 2 lines, `_section_band` = levels × band),
+  drawn by `_draw_bands` → `_band_runs`, `_section_name_top/left(..., level)`.
+- **Complex hierarchy:** `fetch_group_order.complex_hierarchy(sections) -> {name: parent name}` via QuickGO
+  ancestors (`_go_ancestors(ids, relations)`, cached `go/ancestors_is_a_part_of.json`, `…_is_a.json`):
+  containers = (is_a+part_of ancestors) − (is_a ancestors), restricted to assemblies (`_GO_ASSEMBLIES`:
+  is_a-below GO:0032991 or GO:0043228 membraneless organelle — the ribosome is not a "complex" term in
+  current GO), minus `_GO_TOO_GENERAL`; must hold ≥2 sections; a general term covered by a more specific
+  one is dropped; laminar (boxes in boxes) selection smallest first. 2SDA Links: ribosome → {cytosolic
+  ribosome → {LSU, SSU}, small ribosomal subunit}. `_group_and_sort(proteins, assignment, parents=None)`
+  keeps subtrees together (own proteins first, then subgroups biggest first); identical to before without
+  parents. CLI `print_matrix(..., parents=)` prints a banner line per bigger-complex level and
+  `[bigger > section]` row markers; `section_path()` helper. 
+- **Positions:** `_detect_position_cols` also accepts `fromSite`/`ToSite` (xiFDR Links files).
+- **Annotations:** new `scripts/fetch_features.py` (`FEATURE_TYPES` = 8 UniProt types → `ft_*` fields,
+  `features_for(proteins)`, cache `uniprot/features.json`). GUI "Annotations" group (checkbox + colour
+  swatch, fixed categorical colours `_FEATURE_COLOURS` from the dataviz palette); fetched in a thread on
+  first tick; `_tracks_for(slots)` → `_slot_tracks` (type × slot), `_tracks_per_block` (logical_or per
+  block); drawn by `_draw_tracks` between the names and the matrix (`_tracks_px` adds to `_label_sizes`,
+  only while residue slots exist). Selection lists features of a single residue (`_features_at`).
+- **Score distribution:** `RangeSlider.set_distribution(targets, decoys)` (HIST_BINS=40, HIST_H=56, log1p
+  count scale — linear made targets invisible next to 63k low decoys); TT bars blue, other quadrants an
+  orange line, bins outside the cutoff grey; fed by `_update_distribution` (links on the axes, shown quadrants).
+- **Zoom on cursor bug fixed:** Tk clamped the view to the matrix, so the wheel anchor drifted near edges and
+  when blocks started (72–103 items in a test). Scroll region now has `_margins()` (view size −
+  `MIN_VISIBLE_PX`); `_update_scrollregion` keeps the pixel origin; slider zoom (anchor None) still clamps to
+  the matrix edges. Wheel also bound on the header/row-label canvases. Verified: 0 drift for 24 wheel steps
+  at protein and residue level (pointer fixed in screen coords; the old test moved it with the canvas).
+- Verified: CLI alpha/confidence/size goldens identical; `tests/matrix.py` passes; GUI smoke test on 2SDA
+  Links (82678 residue slots; Show Residue 0.26 s) with numpy and pygame: no render errors.

@@ -23,7 +23,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fetch_group_order import order_by_go_complex, short_accession
+from fetch_group_order import complex_hierarchy, order_by_go_complex, short_accession
 from xlms.io import read_fasta
 
 
@@ -161,10 +161,12 @@ def _detect_decoy_cols(lower: dict[str, str]) -> dict[str, str]:
 
 def _detect_position_cols(lower: dict[str, str]) -> dict[str, str] | None:
     """Where the residue positions are. Either the file already has the
-    position in the protein ("direct": SeqPos, Pos or Position), or it has the
+    position in the protein ("direct": SeqPos, Pos, Position or
+    fromSite/ToSite), or it has the
     peptide start plus the link offset in the peptide ("pep_link").
     Returns None if neither is there."""
-    for a, b in (("seqpos1", "seqpos2"), ("pos1", "pos2"), ("position1", "position2")):
+    for a, b in (("seqpos1", "seqpos2"), ("pos1", "pos2"), ("position1", "position2"),
+                 ("fromsite", "tosite")):   # xiFDR "Links" files
         if a in lower and b in lower:
             return {"format": "direct", "pos1": lower[a], "pos2": lower[b]}
     if all(k in lower for k in ("peppos1", "peppos2", "linkpos1", "linkpos2")):
@@ -533,9 +535,21 @@ def _section_header_line(items: list, sections: dict, split: int, row_prefix: st
         while j < n and not (has_sep and j == split) and sections.get(items[j], "") == label:
             j += 1
         span = (j - i) * CELL_W
-        line += ("=" + label[:span - 2].center(span - 2) + "=")[:span].ljust(span)
+        if label:
+            line += ("=" + label[:span - 2].center(span - 2) + "=")[:span].ljust(span)
+        else:
+            line += " " * span
         i = j
     return line
+
+
+def section_path(section: str, parents: dict[str, str]) -> list[str]:
+    """The section and the bigger complexes around it (see
+    complex_hierarchy), biggest first."""
+    path = [section]
+    while path[0] in parents:
+        path.insert(0, parents[path[0]])
+    return path
 
 
 def print_matrix(
@@ -548,12 +562,15 @@ def print_matrix(
     row_label_fn=None,
     legend_source: str = "col",
     row_sections: bool = True,
+    parents: dict[str, str] | None = None,
 ) -> None:
     """Print the dot matrix. `items` are protein names or residues.
     legend_source ("col" or "row") says which labels the name legend at the
     bottom explains. With row_sections, each section also gets a [name]
     line above its first row, so the sections can be read off on the left
-    too (not needed when the row labels already say it, as in residue mode)."""
+    too (not needed when the row labels already say it, as in residue mode).
+    `parents` names the bigger complex of a section; each level of them
+    gets its own banner line above the sections."""
     col_label_fn = col_label_fn or (lambda p: _truncate(p, COL_W))
     row_label_fn = row_label_fn or (lambda p: _truncate(p, ROW_W))
 
@@ -567,7 +584,12 @@ def print_matrix(
 
     # The matrix has a direction, so say which side of a crosslink is which
     print("rows = Protein1, columns = Protein2 (a crosslink A,B is in row A, column B)")
+    paths = {it: section_path(sections.get(it, ""), parents or {}) for it in items} if sections else {}
     if sections:
+        # the bigger complexes first, the biggest on top
+        for up in range(max(len(p) for p in paths.values()) - 1, 0, -1):
+            above = {it: p[-1 - up] if len(p) > up else "" for it, p in paths.items()}
+            print(_section_header_line(items, above, split, row_prefix))
         print(_section_header_line(items, sections, split, row_prefix))
 
     # column labels, one character per printed line
@@ -586,7 +608,7 @@ def print_matrix(
         if sections and row_sections:
             label = sections.get(pi, "")
             if row == 0 or row == split or label != sections.get(items[row - 1], ""):
-                print(f"[{label}]" if label else "[–]")
+                print(f"[{' > '.join(paths[pi])}]" if label else "[–]")
         line = row_labels[row].ljust(ROW_W) + "  "
         for col, pj in enumerate(items):
             if has_sep and col == split:
@@ -678,7 +700,9 @@ def main() -> None:
         )
     else:
         items, sections = sort_proteins(items, is_decoy, args.order, sequences, args.locations)
-        labels = {}
+        # complexes that are part of a bigger one get that one as a banner too
+        parents = complex_hierarchy(set(sections.values())) if args.order == "complex" else {}
+        labels = dict(parents=parents)
 
     _, peak_traced = tracemalloc.get_traced_memory()
     tracemalloc.stop()

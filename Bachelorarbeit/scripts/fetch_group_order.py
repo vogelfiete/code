@@ -3,7 +3,10 @@
 Gene Ontology (through UniProt) tells us which complexes a protein is part
 of. Proteins that share a complex are put next to each other, and each
 protein gets the name of its group as a section label for the matrix
-headers. print_matrix.py uses this through order_by_go_complex().
+headers. Complexes that are part of a bigger one (the subunits of the
+ribosome, ...) are kept next to each other, and complex_hierarchy() says
+which bigger complex each section belongs to. print_matrix.py uses this
+through order_by_go_complex() and complex_hierarchy().
 
 Everything downloaded is cached as JSON under ~/.cache/xlms_matrix/, so each
 lookup only hits the internet once."""
@@ -15,7 +18,7 @@ import urllib.request
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 _CACHE_ROOT = Path.home() / ".cache" / "xlms_matrix"
 _USER_AGENT = {"User-Agent": "xlms-matrix/1.0"}
@@ -98,21 +101,41 @@ def _assign_primary_groups(
     return assignment
 
 
-def _group_and_sort(proteins: list[str], assignment: dict[str, str]) -> list[str]:
+def _group_and_sort(proteins: list[str], assignment: dict[str, str],
+                    parents: dict[str, str] | None = None) -> list[str]:
     """Biggest section first and "Unknown" last; inside a section the
-    proteins keep the order they came in."""
-    groups: dict[str, list[str]] = defaultdict(list)
+    proteins keep the order they came in. With `parents` (see
+    complex_hierarchy) the sections of one bigger complex stay together:
+    a group lists its own proteins first, then its subgroups, biggest first."""
+    parents = parents or {}
+    own: dict[str, list[str]] = defaultdict(list)       # group -> its own proteins
     for p in proteins:
-        groups[assignment[p]].append(p)
-    sections = sorted((s for s in groups if s != "Unknown"), key=lambda s: -len(groups[s]))
-    if "Unknown" in groups:
-        sections.append("Unknown")
-    return [p for s in sections for p in groups[s]]
+        own[assignment[p]].append(p)
+    children: dict[str, list[str]] = defaultdict(list)  # group -> its subgroups
+    top: list[str] = []                                  # groups without a bigger one
+    seen: set[str] = set()
+    for name in list(own):
+        # walk up to the biggest complex, remembering which group holds which
+        while name not in seen:
+            seen.add(name)
+            parent = parents.get(name)
+            if parent is None:
+                top.append(name)
+                break
+            children[parent].append(name)
+            name = parent
 
+    def size(name: str) -> int:
+        return len(own[name]) + sum(size(c) for c in children[name])
 
-def _order_by_memberships(proteins, memberships, term_names):
-    assignment = _assign_primary_groups(proteins, memberships, term_names)
-    return _group_and_sort(proteins, assignment), assignment
+    def emit(name: str) -> list[str]:
+        subgroups = sorted(children[name], key=lambda c: -size(c))
+        return own[name] + [p for c in subgroups for p in emit(c)]
+
+    order = sorted((g for g in top if g != "Unknown"), key=lambda g: -size(g))
+    if "Unknown" in top:
+        order.append("Unknown")
+    return [p for g in order for p in emit(g)]
 
 
 # -----------------------------------------------------------------------------
@@ -198,13 +221,115 @@ def order_by_go_complex(
         terms = cache.get(bare[protein], [])
         memberships[protein] = {go for go, _ in terms if go in complexes}
         term_names.update((go, name) for go, name in terms)
-    if not locations:
-        return _order_by_memberships(proteins, memberships, term_names)
 
     assignment = _assign_primary_groups(proteins, memberships, term_names)
+    parents = complex_hierarchy(set(assignment.values()))
+    if not locations:
+        return _group_and_sort(proteins, assignment, parents), assignment
+
     in_complex = [p for p in proteins if assignment[p] != "Unknown"]
     rest = [p for p in proteins if assignment[p] == "Unknown"]
     # second round for the rest, on the terms that aren't complexes
     places = {p: {go for go, _ in cache.get(bare[p], []) if go not in all_complexes} for p in rest}
     assignment.update(_assign_primary_groups(rest, places, term_names))
-    return _group_and_sort(in_complex, assignment) + _group_and_sort(rest, assignment), assignment
+    return (_group_and_sort(in_complex, assignment, parents)
+            + _group_and_sort(rest, assignment)), assignment
+
+
+# -----------------------------------------------------------------------------
+# Complexes inside bigger complexes
+#
+# Some complexes are part of a bigger one: the large and the small ribosomal
+# subunit are both part of the ribosome. GO stores this as "part of"
+# relations, and QuickGO lists all terms above a term. Terms above a section
+# that the section is only a kind of ("ribosomal subunit") don't count, and
+# neither do places ("cytosol"); only the assemblies it is a part of do. A
+# bigger complex is only used when it holds at least two of the sections,
+# and the bigger complexes nest like boxes in boxes, so the sections end up
+# in one tree.
+# -----------------------------------------------------------------------------
+
+_QUICKGO_BATCH = 50   # GO ids per QuickGO request
+# What counts as a bigger complex: a kind of protein-containing complex, or
+# of membraneless organelle (GO files the ribosome there), but not those two
+# general terms themselves
+_GO_ASSEMBLIES = {_GO_COMPLEX_ROOT, "GO:0043228"}
+_GO_TOO_GENERAL = {_GO_COMPLEX_ROOT, "GO:0043228", "GO:0043232"}
+
+
+def _go_ancestors(ids: Iterable[str], relations: str) -> dict[str, dict]:
+    """{GO id: {"name": ..., "ancestors": [GO ids]}} for each id, following
+    the given relations ("is_a" or "is_a,part_of"). The ancestors include
+    the term itself. Cached; only new ids are asked for."""
+    cache_file = _cache_path("go", f"ancestors_{relations.replace(',', '_')}.json")
+    cache: dict[str, dict] = _load_cache(cache_file) or {}
+    ids = set(ids)
+    missing = sorted(ids - cache.keys())
+    for k in range(0, len(missing), _QUICKGO_BATCH):
+        batch = missing[k:k + _QUICKGO_BATCH]
+        url = ("https://www.ebi.ac.uk/QuickGO/services/ontology/go/terms/"
+               + ",".join(batch) + f"/ancestors?relations={relations}")
+        for r in json.loads(_get(url))["results"]:
+            cache[r["id"]] = {"name": r["name"], "ancestors": r.get("ancestors", [])}
+    if missing:
+        _save_cache(cache_file, cache)
+    return {i: cache[i] for i in ids if i in cache}
+
+
+def complex_hierarchy(sections: Iterable[str]) -> dict[str, str]:
+    """For section names from order_by_go_complex(), the bigger complexes
+    they are part of, as {name: name of the complex one level up}. A
+    bigger complex can be a section itself, and it can have a bigger
+    complex above it again. Sections that aren't GO complexes ("Unknown",
+    locations) get none. Empty if nothing is found or QuickGO can't be
+    reached."""
+    # the GO ids of the sections, from the names UniProt gave them
+    cached = _load_cache(_cache_path("go", "uniprot_cellular_component.json")) or {}
+    by_name = {name: go for terms in cached.values() for go, name in terms}
+    complexes = _go_complex_terms()
+    ids = {by_name[s]: s for s in sections if by_name.get(s) in complexes}
+    if len(ids) < 2:
+        return {}
+    try:
+        above = _go_ancestors(ids, "is_a,part_of")
+        kind_of = _go_ancestors(ids, "is_a")
+        part_of = {go: set(above[go]["ancestors"]) - set(kind_of[go]["ancestors"])
+                   for go in ids if go in above and go in kind_of}
+        # only assemblies count as bigger complexes, not places like "cytosol"
+        kinds = _go_ancestors(set().union(*part_of.values()), "is_a")
+        assemblies = {c for c, k in kinds.items()
+                      if c not in _GO_TOO_GENERAL and _GO_ASSEMBLIES & set(k["ancestors"])}
+        # which sections each assembly holds (a section holds itself)
+        holds: dict[str, set[str]] = defaultdict(set)
+        for go, containers in part_of.items():
+            for c in (containers & assemblies) | {go}:
+                holds[c].add(go)
+        holds = {c: members for c, members in holds.items() if len(members) >= 2}
+        info = {**above, **_go_ancestors(holds, "is_a,part_of")}
+    except Exception as e:
+        warnings.warn(f"GO: QuickGO request failed, complexes not nested — {e}")
+        return {}
+
+    def covered(c: str) -> bool:
+        """A general term ("ribosome") that a more specific one ("cytosolic
+        ribosome") already covers completely says nothing new."""
+        return any(c in info.get(d, {}).get("ancestors", ()) and holds[d] >= holds[c]
+                   for d in holds if d != c)
+
+    # keep the boxes that fit into each other, smallest first
+    kept: list[str] = []
+    for c in sorted((c for c in holds if not covered(c)), key=lambda c: (len(holds[c]), c)):
+        if all(holds[c].isdisjoint(holds[k]) or holds[c] > holds[k] for k in kept):
+            kept.append(c)
+
+    def name(go: str) -> str:
+        return ids.get(go) or info[go]["name"]
+
+    parents: dict[str, str] = {}
+    for go in {*ids, *kept}:
+        # the smallest kept box around it (kept is sorted by size)
+        inside = holds[go] if go in kept else {go}
+        parent = next((k for k in kept if holds[k] > inside), None)
+        if parent is not None:
+            parents[name(go)] = name(parent)
+    return parents
