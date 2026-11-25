@@ -10,6 +10,7 @@ enough, neighbouring rows and columns are merged into blocks and their
 scores are combined."""
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import os
@@ -32,16 +33,11 @@ try:
 except Exception:
     _pygame = None  # type: ignore[assignment]
 
-try:
-    import matplotlib
-    _MPL = True
-except Exception:
-    _MPL = False
-
 _DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_DIR, "..", "scripts"))
 sys.path.insert(0, os.path.join(_DIR, "..", "src"))
 
+from data_source import add_data_args, describe, load_data  # type: ignore[import]
 from fetch_features import FEATURE_TYPES, features_for  # type: ignore[import]
 from print_matrix import (  # type: ignore[import]
     COL_W,
@@ -56,7 +52,6 @@ from print_matrix import (  # type: ignore[import]
     short_accession,
     sort_proteins,
 )
-from xlms.io import read_fasta  # type: ignore[import]
 
 
 # -----------------------------------------------------------------------------
@@ -98,6 +93,18 @@ _BG = (255, 255, 255)
 _FG = (0, 0, 0)
 _SEP = (153, 153, 153)
 _HL = (0, 120, 215)  # outline of the selected cell
+_SPLIT = (60, 60, 60)     # the line between targets and decoys (the quadrants)
+SPLIT_PX = 3              # its thickness, so it can always be seen
+# Lines through the matrix between open groups and proteins, one colour per
+# level of the axis tree: the biggest groups get the darkest line
+_LAYER_LINES = [(140, 140, 140), (185, 185, 185), (210, 210, 210)]
+# The colour scale: ColorBrewer "RdBu" with 10 classes
+# (https://colorbrewer2.org/?type=diverging&scheme=RdBu&n=10), lowest
+# scores blue, highest red. Every colour is one quantile step of the scores
+# (see Colours in MatrixApp), so there are as many steps as colours.
+_SCALE = ["#053061", "#2166ac", "#4393c3", "#92c5de", "#d1e5f0",
+          "#fddbc7", "#f4a582", "#d6604d", "#b2182b", "#67001f"]
+COLOUR_STEPS = len(_SCALE)
 
 # Annotation tracks: one thin coloured strip per feature type along the
 # residue axes, in a fixed colour per type
@@ -105,6 +112,9 @@ TRACK_PX = 4              # thickness of one track
 TRACK_GAP_PX = 1          # space between two tracks
 _FEATURE_COLOURS = dict(zip(FEATURE_TYPES, [
     "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]))
+# In the matrix, every annotated residue row and column is tinted with the
+# feature's colour, this strongly (0 = not at all, 1 = full colour)
+TRACK_TINT = 0.18
 
 # What the "Show" buttons open: every group and protein is set to fit
 _SHOW_LEVELS = ["Top", "Complex", "Protein", "Residue"]
@@ -112,9 +122,9 @@ _SHOW_LEVELS = ["Top", "Complex", "Protein", "Residue"]
 # Score distribution above the cutoff slider
 HIST_H = 56               # height of the plot in pixels
 HIST_BINS = 40
-_TARGET_COLOUR = "#2a78d6"
+_TARGET_COLOUR = "#2a78d6"    # target bars until the colour scale is known
 _DECOY_COLOUR = "#eb6834"
-_OUTSIDE_COLOUR = "#d4d4d4"   # bars outside the cutoff
+_OUTSIDE_COLOUR = "#c8c8c8"   # outline of the bars outside the cutoff
 
 # The first of these fonts that exists is used (Windows, then Linux, then
 # macOS). If none is found, Pillow's own font is used.
@@ -178,12 +188,16 @@ def _wrap_label(text: str, font, width: float, max_lines: int = 2) -> list[str]:
     return lines
 
 
-def _make_lut(cmap_name: str) -> np.ndarray:
-    """A table of 256 RGB colours taken from a matplotlib colormap."""
-    if not _MPL:
-        return np.zeros((256, 3), dtype=np.uint8)
-    cmap = matplotlib.colormaps[cmap_name]
-    return (cmap(np.linspace(0, 1, 256))[:, :3] * 255).astype(np.uint8)
+def _hex_rgb(colour: str) -> tuple[int, int, int]:
+    """"#2a78d6" -> (42, 120, 214)"""
+    return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _rgb_hex(rgb) -> str:
+    return "#%02x%02x%02x" % tuple(int(v) for v in rgb)
+
+
+_SCALE_RGB = np.array([_hex_rgb(c) for c in _SCALE], dtype=np.uint8)
 
 
 def _auto_fg(bg_rgb: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -264,6 +278,9 @@ class RangeSlider(tk.Canvas):
         self._drag: str | None = None   # which handle is being dragged: "lo", "hi" or None
         # number of target and decoy scores per bin, see set_distribution
         self._counts: tuple[np.ndarray, np.ndarray] | None = None
+        # the colour of every bin, the same as the cells with that score get
+        # (see set_bin_colours); None until the app has set them
+        self._bin_colours: list[str] | None = None
         self.bind("<Configure>", lambda _e: self._redraw())
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<B1-Motion>", self._on_drag)
@@ -275,8 +292,24 @@ class RangeSlider(tk.Canvas):
         self._lo, self._hi = lo, hi
         self._redraw()
 
+    def set_range(self, lo: float, hi: float) -> None:
+        """Move the handles to lo and hi (kept inside the full range)."""
+        self._lo, self._hi = max(lo, self._min), min(hi, self._max)
+        self._redraw()
+
     def values(self) -> tuple[float, float]:
         return self._lo, self._hi
+
+    def bin_centres(self) -> np.ndarray:
+        """The middle score of every bin of the distribution."""
+        edges = np.linspace(self._min, self._max, HIST_BINS + 1)
+        return (edges[:-1] + edges[1:]) / 2
+
+    def set_bin_colours(self, colours: list[str] | None) -> None:
+        """Colour the bars like the cells: one "#rrggbb" per bin."""
+        if colours != self._bin_colours:
+            self._bin_colours = colours
+            self._redraw()
 
     def set_distribution(self, targets: np.ndarray, decoys: np.ndarray) -> None:
         """Show how the target and decoy scores are spread over [min, max]:
@@ -304,7 +337,8 @@ class RangeSlider(tk.Canvas):
     def _draw_distribution(self) -> None:
         """Bars for the targets, a line for the decoys, on one common
         logarithmic count scale (the many low-scoring decoys would flatten
-        everything else). Bins outside [lo, hi] are grey. A small legend
+        everything else). The bars have the colours of the cells (like the
+        legend); bins outside [lo, hi] are only outlined. A small legend
         sits in the top left."""
         if self._counts is None:
             return
@@ -321,8 +355,12 @@ class RangeSlider(tk.Canvas):
             x0, x1 = self._x(edges[k]), self._x(edges[k + 1])
             inside = edges[k + 1] >= self._lo and edges[k] <= self._hi
             if targets[k]:
-                self.create_rectangle(x0 + 0.5, y(targets[k]), x1 - 0.5, bottom,
-                                      fill=_TARGET_COLOUR if inside else _OUTSIDE_COLOUR, width=0)
+                if inside:
+                    fill = self._bin_colours[k] if self._bin_colours else _TARGET_COLOUR
+                    self.create_rectangle(x0 + 0.5, y(targets[k]), x1 - 0.5, bottom, fill=fill, width=0)
+                else:
+                    self.create_rectangle(x0 + 0.5, y(targets[k]), x1 - 0.5, bottom,
+                                          outline=_OUTSIDE_COLOUR, width=1)
             decoy_line += [x0, y(decoys[k]), x1, y(decoys[k])]
         if decoys.any():
             self.create_line(*decoy_line, fill=_DECOY_COLOUR, width=2)
@@ -335,6 +373,12 @@ class RangeSlider(tk.Canvas):
         for colour, name, line in ((_TARGET_COLOUR, "target", False), (_DECOY_COLOUR, "decoy", True)):
             if line:
                 self.create_line(x, 6, x + 10, 6, fill=colour, width=2)
+            elif self._bin_colours:
+                # the targets have the whole colour scale: a small piece of it
+                bins = self._bin_colours
+                for k, c in enumerate((bins[0], bins[len(bins) // 2], bins[-1])):
+                    self.create_rectangle(x + 4 * k, 2, x + 4 * k + 4, 10, fill=c, width=0)
+                x += 2
             else:
                 self.create_rectangle(x, 2, x + 10, 10, fill=colour, width=0)
             item = self.create_text(x + 14, 6, text=name, anchor="w", font=("TkDefaultFont", 8))
@@ -490,11 +534,25 @@ class MatrixApp(tk.Tk):
     # and (if available) the pygame renderer.
     # -------------------------------------------------------------------------
 
-    def __init__(self, initial_csv: str | None = None) -> None:
+    def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
-        self.title("XL-MS Matrix Viewer")
+        self.title(f"XL-MS Matrix Viewer - {describe(args)}")
         self.geometry("1200x800")
         self.minsize(700, 450)
+
+        # Where the data comes from (the command line options, see
+        # data_source.py), and the crosslink table and sequences once they
+        # are loaded. They are only loaded once; Load after that just builds
+        # the matrix again with the current Order.
+        self._args = args
+        self._table = None
+        self._loaded_seqs: dict[str, str] | None = None
+        # The Order and location settings the matrix was last built with.
+        # Changing them builds it again right away; a change while that is
+        # still running is picked up as soon as it is done.
+        self._built_with: tuple[str, bool] | None = None
+        self._loading: bool = False
+        self._reload_wanted: bool = False
 
         # The loaded data: the best score of every protein pair and of every
         # residue pair (empty without residue positions in the CSV), each
@@ -549,6 +607,11 @@ class MatrixApp(tk.Tk):
         self._overview: bool = False
         self._item_to_block: list[int] = []
         self._split_block: int = 0
+        # Where one open group or protein ends and the next begins, between
+        # block k-1 and block k, and the level of the tree it belongs to
+        # (lines are drawn through the matrix there, see _find_borders)
+        self._border_pos: np.ndarray = np.zeros(0, dtype=np.int64)
+        self._border_level: np.ndarray = np.zeros(0, dtype=np.int64)
         self._agg_method: str = "geomean"
         # Folded, the crosslinks A→B and B→A share one cell below the
         # diagonal and the matrix becomes a triangle
@@ -565,8 +628,6 @@ class MatrixApp(tk.Tk):
         self._cell_rgb: np.ndarray = np.zeros((0, 3), dtype=np.uint8)
 
         # Colours
-        self._cmap_name: str = "coolwarm"
-        self._cmap_lut: np.ndarray | None = None   # None means greyscale
         self._min_score: float = 0.0
         self._max_score: float = 1.0
         self._score_sorted: np.ndarray = np.array([])
@@ -589,6 +650,8 @@ class MatrixApp(tk.Tk):
         # whether it has turned into a drag
         self._drag_start: tuple[int, int, float, float] | None = None
         self._dragging: bool = False
+        self._pg_pressed: bool = False   # the press came through pygame, not Tk (see _poll_pygame_events)
+        self._zoom_min_pending: bool = False
         self._zoom_value: int = CELL_PX_DEFAULT    # the zoom slider value that is shown right now
         self._zoom_min: int = CELL_PX_MIN - BLOCK_ZOOM_STEPS   # lowest slider value; lower for big matrices
 
@@ -631,9 +694,7 @@ class MatrixApp(tk.Tk):
         if _pygame is not None:
             self._init_pygame()
 
-        if initial_csv:
-            self._csv_var.set(initial_csv)
-            self._load()
+        self._load()
 
     # -------------------------------------------------------------------------
     # The control panel on the left
@@ -669,46 +730,34 @@ class MatrixApp(tk.Tk):
             if button:
                 button.grid(row=row, column=2, padx=(2, 0))
 
-        # Data: which files to load and how
+        # Data: where it comes from (set on the command line) and how to show it
         data = group("Data")
-        self._csv_var = tk.StringVar()
-        field(data, 0, "CSV", tk.Entry(data, textvariable=self._csv_var, width=10),
-              tk.Button(data, text="…", width=2, command=self._browse_csv))
-        self._fasta_var = tk.StringVar()
-        field(data, 1, "FASTA", tk.Entry(data, textvariable=self._fasta_var, width=10),
-              tk.Button(data, text="…", width=2, command=self._browse_fasta))
+        tk.Label(data, text=describe(self._args), wraplength=wrap, justify=tk.LEFT).grid(
+            row=0, column=0, columnspan=3, sticky="w")
         self._order_var = tk.StringVar(value="confidence")
-        field(data, 3, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
+        field(data, 1, "Order", ttk.Combobox(data, textvariable=self._order_var, width=10,
                                              state="readonly", values=ORDER_MODES))
         # only used by the "complex" order: group the rest by cellular location
         self._locations_var = tk.BooleanVar(value=False)
         locations = tk.Checkbutton(data, text="Group rest by location",
                                    variable=self._locations_var)
-        field(data, 5, "", locations)
+        field(data, 2, "", locations)
         locations.grid_remove()   # grid() brings it back with the same options
+        # both take effect right away: the matrix is sorted again
         self._order_var.trace_add("write", lambda *_: (
-            locations.grid() if self._order_var.get() == "complex" else locations.grid_remove()))
+            locations.grid() if self._order_var.get() == "complex" else locations.grid_remove(),
+            self._load()))
+        self._locations_var.trace_add("write", lambda *_: self._load())
 
         buttons = tk.Frame(data)
-        buttons.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 0))
-        self._load_btn = tk.Button(buttons, text="Load", command=self._load, width=8)
-        self._load_btn.pack(side=tk.LEFT)
-        tk.Button(buttons, text="Export PNG…", command=self._export).pack(side=tk.LEFT, padx=4)
+        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        tk.Button(buttons, text="Export PNG…", command=self._export).pack(side=tk.LEFT)
         self._status_var = tk.StringVar(value="No data loaded.")
         tk.Label(data, textvariable=self._status_var, fg="gray", wraplength=wrap,
-                 justify=tk.LEFT).grid(row=7, column=0, columnspan=3, sticky="w")
+                 justify=tk.LEFT).grid(row=4, column=0, columnspan=3, sticky="w")
 
         # Display: colours, zoom and how blocks are combined
         display = group("Display")
-        self._cmap_var = tk.StringVar(value="(none)")
-        field(display, 0, "Colormap", ttk.Combobox(
-            display, textvariable=self._cmap_var, width=10, state="readonly",
-            values=["(none)", "coolwarm"] if _MPL else ["(none)"],
-        ))
-        self._cmap_var.trace_add("write", lambda *_: self._on_colormap_change())
-        if not _MPL:
-            tk.Label(display, text="(matplotlib not available)", fg="red").grid(
-                row=1, column=0, columnspan=3, sticky="w")
 
         self._zoom_label_var = tk.StringVar(value=f"{CELL_PX_DEFAULT}px")
         self._zoom = tk.Scale(
@@ -827,20 +876,13 @@ class MatrixApp(tk.Tk):
         def wheel(event: tk.Event) -> None:
             # this is bound for the whole app, so only react while the mouse is over the panel
             if is_inside(self.winfo_containing(event.x_root, event.y_root)):
-                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                up = event.num == 4 or event.delta > 0
+                canvas.yview_scroll(-1 if up else 1, "units")
 
-        self.bind_all("<MouseWheel>", wheel, add="+")
+        # Windows and macOS send <MouseWheel>, Linux (X11) Button-4/5
+        for name in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(name, wheel, add="+")
         return inner
-
-    def _browse_csv(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
-        if p:
-            self._csv_var.set(p)
-
-    def _browse_fasta(self) -> None:
-        p = filedialog.askopenfilename(filetypes=[("FASTA", "*.fasta *.fa *.faa"), ("All", "*.*")])
-        if p:
-            self._fasta_var.set(p)
 
     # -------------------------------------------------------------------------
     # The matrix area
@@ -879,7 +921,8 @@ class MatrixApp(tk.Tk):
         for canvas in (self._ch_canvas, self._rl_canvas):
             for wheel in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 canvas.bind(wheel, self._wheel)
-        self._mx.bind("<Configure>", lambda _e: (self._update_scrollregion(), self._schedule()))
+        self._mx.bind("<Configure>", lambda _e: (self._update_scrollregion(), self._schedule(),
+                                                 self._schedule_zoom_min()))
         self._mx.bind("<MouseWheel>", self._wheel)
         self._mx.bind("<Button-4>", self._wheel)
         self._mx.bind("<Button-5>", self._wheel)
@@ -1011,6 +1054,13 @@ class MatrixApp(tk.Tk):
         self._pg_host.place(x=0, y=0, relwidth=1, relheight=1)
         for wheel in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self._pg_host.bind(wheel, self._wheel)
+        # On Windows the mouse buttons reach pygame (see _poll_pygame_events).
+        # On Linux (X11) only one program can listen for button presses on a
+        # window, and Tk already does, so pygame never sees them: there Tk
+        # passes them on. A press that arrives both ways does no harm.
+        self._pg_host.bind("<ButtonPress-1>", lambda e: self._press(e.x, e.y))
+        self._pg_host.bind("<B1-Motion>", lambda e: self._drag_to(e.x, e.y))
+        self._pg_host.bind("<ButtonRelease-1>", lambda e: self._release(e.x, e.y))
         self.update_idletasks()
         os.environ["SDL_WINDOWID"] = str(self._pg_host.winfo_id())
         _pygame.display.quit()
@@ -1051,11 +1101,14 @@ class MatrixApp(tk.Tk):
         for ev in _pygame.event.get():
             if ev.type == _pygame.MOUSEBUTTONDOWN and ev.button == 1:
                 self._press(*ev.pos)
+                self._pg_pressed = True
             elif ev.type == _pygame.MOUSEMOTION:
                 if ev.buttons[0]:
                     self._drag_to(*ev.pos)
-                else:
-                    # the button was let go somewhere we couldn't see it
+                elif self._pg_pressed:
+                    # the button was let go somewhere we couldn't see it. Only
+                    # for a press pygame saw itself: on Linux the press goes
+                    # to Tk, and pygame thinks the button is up all along
                     self._release(*ev.pos)
             elif ev.type == _pygame.MOUSEBUTTONUP and ev.button == 1:
                 self._release(*ev.pos)
@@ -1201,6 +1254,7 @@ class MatrixApp(tk.Tk):
             self._select_at(x, y)
         self._drag_start = None
         self._dragging = False
+        self._pg_pressed = False
 
     def _show_drag_cursor(self, dragging: bool) -> None:
         """Show the four-arrow cursor while the matrix is being dragged."""
@@ -1215,24 +1269,31 @@ class MatrixApp(tk.Tk):
     # -------------------------------------------------------------------------
     # Loading data
     #
-    # The CSV is read in a background thread so the window doesn't freeze;
-    # the result is handed back to the Tk thread when it's ready.
+    # The crosslinks are read (from the CSV or the API) in a background
+    # thread so the window doesn't freeze; the result is handed back to the
+    # Tk thread when it's ready.
     # -------------------------------------------------------------------------
 
     def _load(self) -> None:
-        csv = self._csv_var.get().strip()
+        """Build the matrix with the current Order. Called at the start and
+        whenever Order or "Group rest by location" changes; the data itself
+        is only read the first time."""
         order = self._order_var.get()
-        fasta = self._fasta_var.get().strip() or None
-        locations = self._locations_var.get()
-        if not csv:
-            messagebox.showerror("Error", "Please select a CSV file.")
+        locations = self._locations_var.get() and order == "complex"
+        if (order, locations) == self._built_with:
+            return   # nothing that matters changed (e.g. the same order picked again)
+        if self._loading:
+            self._reload_wanted = True   # done as soon as the running one is finished
             return
-        if order == "sequence" and not fasta:
-            messagebox.showerror("Error", "Order 'sequence' requires a FASTA file.")
+        if order == "sequence" and not (self._args.fasta or self._args.uuid):
+            messagebox.showerror("Error", "Order 'sequence' needs sequences: start with --fasta.")
+            # back to what is on screen (that calls _load again, which then does nothing)
+            self._order_var.set(self._built_with[0] if self._built_with else "confidence")
             return
 
-        self._load_btn.configure(state=tk.DISABLED)
-        self._status_var.set("Loading…")
+        self._loading = True
+        self._built_with = (order, locations)
+        self._status_var.set("Loading…" if self._table is None else "Sorting…")
 
         def worker() -> None:
             try:
@@ -1242,13 +1303,15 @@ class MatrixApp(tk.Tk):
                 # doesn't see — so it's collected here and shown in Status.
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
-                    seqs = read_fasta(fasta) if fasta else None
-                    proteins, prot_sparse, decoy = build_matrix(csv, n=None)   # always all proteins
+                    if self._table is None:
+                        self._table, self._loaded_seqs = load_data(self._args)
+                    seqs = self._loaded_seqs
+                    proteins, prot_sparse, decoy = build_matrix(self._table, n=None)   # always all proteins
                     proteins, sections = sort_proteins(proteins, decoy, order, seqs, locations)
                     parents = complex_hierarchy(set(sections.values())) if order == "complex" and sections else {}
                     # the residues, so that proteins can be opened
                     try:
-                        residues, res_sparse, res_decoy = build_residue_matrix(csv, n=None)
+                        residues, res_sparse, res_decoy = build_residue_matrix(self._table, n=None)
                         if seqs:
                             # with a FASTA, every residue of the loaded proteins is shown,
                             # not only the crosslinked ones
@@ -1266,9 +1329,22 @@ class MatrixApp(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _load_finished(self) -> None:
+        """A load is over; start the next one if a setting changed meanwhile."""
+        self._loading = False
+        if self._reload_wanted:
+            self._reload_wanted = False
+            self._load()
+
     def _on_loaded(self, data: dict, notes: list[str] = ()) -> None:
         """Take over what the load worker read (see _load): build the axis
-        tree and the link arrays, then show the proteins."""
+        tree and the link arrays, then show the proteins. When the matrix is
+        only sorted again, what was open stays open, and the cutoff, the
+        zoom and the annotations stay as they were."""
+        # what was open before (None on the first load)
+        was_open = ({(n.kind, n.key, n.decoy): n.open for top in self._tree for n in top.walk()}
+                    if self._tree else None)
+        old_proteins = set(self._prot_index)
         proteins, decoy = data["proteins"], data["decoy"]
         self._prot_sparse, self._res_sparse = data["prot_sparse"], data["res_sparse"]
         self._seqs = data["seqs"] or {}
@@ -1305,13 +1381,22 @@ class MatrixApp(tk.Tk):
         # measured once over every name that can come up, so the header
         # doesn't change size when something is opened
         self._measure_col_labels([_slot_labels(n)[0] for top in self._tree for n in top.walk()])
-        self._cut_lo, self._cut_hi = self._min_score, self._max_score
-        self._cutoff_slider.set_bounds(self._cut_lo, self._cut_hi)
-        if self._features is not None:
+        if was_open is None:
+            self._cut_lo, self._cut_hi = self._min_score, self._max_score
+        self._cutoff_slider.set_bounds(self._min_score, self._max_score)
+        self._cutoff_slider.set_range(self._cut_lo, self._cut_hi)
+        if self._features is not None and set(proteins) != old_proteins:
             self._features = None   # the new proteins need their own
             self._load_features()
 
-        self._show_level("Protein")   # also moves the view to the top-left corner
+        if was_open is None:
+            self._show_level("Protein")   # also moves the view to the top-left corner
+        else:
+            # new groups (another order) start open, like on the first load
+            for top in self._tree:
+                for node in top.walk():
+                    node.open = was_open.get((node.kind, node.key, node.decoy), node.open)
+            self._apply_axis()
 
         n_targets = sum(1 for p in proteins if not decoy.get(p, False))
         status = (f"Loaded — {n_targets} target · {len(proteins) - n_targets} decoy proteins · "
@@ -1322,7 +1407,7 @@ class MatrixApp(tk.Tk):
             shortened = [n if len(n) <= 220 else n[:220] + "…" for n in notes]
             status += "\n⚠ " + "\n⚠ ".join(shortened)
         self._status_var.set(status)
-        self._load_btn.configure(state=tk.NORMAL)
+        self._load_finished()
 
     # -------------------------------------------------------------------------
     # Opening and closing parts of the axis tree
@@ -1447,11 +1532,7 @@ class MatrixApp(tk.Tk):
         self._clear_selection()
         self._runs = self._find_runs()
         self._recompute_blocks()
-        self._zoom_min = self._find_zoom_min()
-        self._zoom.configure(from_=self._zoom_min)
-        if self._zoom_value < self._zoom_min:   # the new axes need fewer block steps
-            self._on_zoom(str(self._zoom_min))
-            self._zoom.set(self._zoom_min)
+        self._update_zoom_min()   # the new axes may fit at a bigger zoom, or need more block steps
         for target, btn in self._zoom_to_btns.items():
             btn.configure(state=tk.NORMAL if self._zoom_region(target) else tk.DISABLED)
         self._update_distribution()
@@ -1555,53 +1636,57 @@ class MatrixApp(tk.Tk):
         return out
 
     def _on_error(self, msg: str) -> None:
-        self._load_btn.configure(state=tk.NORMAL)
+        self._built_with = None   # so the same settings can be tried again
         self._status_var.set(f"Error: {msg}")
         messagebox.showerror("Load error", msg)
+        self._load_finished()
 
     # -------------------------------------------------------------------------
     # Colours
     #
-    # Without a colormap, low scores are light grey and high scores dark grey.
-    # With one, the colour comes from the colormap and follows the rank of
-    # the score among all scores (quantile).
+    # The scale has COLOUR_STEPS clearly different colours, and every step is
+    # one quantile: with 10 steps, the lowest tenth of the scores gets the
+    # first colour, the next tenth the second, and so on. So every colour
+    # stands for the same share of the scores, and the legend shows exactly
+    # which score range each colour stands for. The quantiles are taken over
+    # the scores inside the score cutoff: narrowing the cutoff spreads the
+    # steps over what is left. The colours are _SCALE (ColorBrewer RdBu).
     # -------------------------------------------------------------------------
 
-    def _on_colormap_change(self) -> None:
-        name = self._cmap_var.get()
-        if name == "(none)":
-            self._cmap_lut = None
-        else:
-            self._cmap_name = name
-            self._cmap_lut = _make_lut(name)
-        self._cell_rgb = self._colours_for(self._cell_scores)
-        self._pg_cache.clear()
-        self._update_legend()
-        self._schedule()
+    def _cutoff_scores(self) -> np.ndarray:
+        """The scores of the level on screen that lie inside the cutoff, sorted."""
+        s = self._score_sorted
+        return s[np.searchsorted(s, self._cut_lo, "left"):np.searchsorted(s, self._cut_hi, "right")]
 
     def _colours_for(self, scores: np.ndarray, ref: np.ndarray | None = None) -> np.ndarray:
-        """The colours of the values, one RGB row each. ref are the sorted
-        values the colours are measured against; without it, the ones the
-        cells on screen use (all scores, or for counts and root sums of
-        squares the values on screen, see _reduce_block_scores). Without a
-        colormap: grey from light (smallest) to dark (largest), linear in
-        between. With one: the colour follows the value's rank in ref
-        (quantile), so the median gets the middle colour."""
+        """The colours of the values, one RGB row each: the colour of the
+        quantile step each value falls into (see _step_edges). ref are the
+        sorted values the steps are measured against; without it, the ones
+        the cells on screen use (the scores inside the cutoff, or for counts
+        and root sums of squares the values on screen, see
+        _reduce_block_scores)."""
         ref = self._colour_ref if ref is None else ref
-        mn, mx = (ref[0], ref[-1]) if len(ref) else (0.0, 1.0)
-        if self._cmap_lut is None:
-            if mx > mn:
-                grey = (200 - (scores - mn) / (mx - mn) * 160).astype(np.int64)
-            else:
-                grey = np.full(len(scores), 120, dtype=np.int64)
-            grey = np.clip(grey, 40, 200).astype(np.uint8)
-            return np.stack([grey, grey, grey], axis=1)
-        ranked = ref
-        if len(ranked) > 0:
-            idx = (np.searchsorted(ranked, scores) / len(ranked) * 255).astype(np.int64)
-        else:
-            idx = np.full(len(scores), 128, dtype=np.int64)
-        return self._cmap_lut[np.clip(idx, 0, 255)]
+        return self._step_colours()[self._steps_of(np.asarray(scores, dtype=float), ref)]
+
+    @staticmethod
+    def _step_colours() -> np.ndarray:
+        """The COLOUR_STEPS colours of the scale as RGB rows, lowest step first."""
+        return _SCALE_RGB
+
+    @staticmethod
+    def _step_edges(ref: np.ndarray) -> np.ndarray:
+        """Where the steps begin and end: COLOUR_STEPS + 1 values, from the
+        smallest value in ref to the largest, with the same share of ref
+        between each two neighbours (quantiles)."""
+        return np.quantile(ref, np.linspace(0, 1, COLOUR_STEPS + 1))
+
+    def _steps_of(self, values: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        """Which step (0 to COLOUR_STEPS - 1) each value falls into. A value
+        on the border between two steps belongs to the upper one."""
+        if len(ref) == 0:
+            return np.full(len(values), COLOUR_STEPS // 2, dtype=np.int64)
+        inner = self._step_edges(ref)[1:-1]
+        return np.searchsorted(inner, values, side="right").astype(np.int64)
 
     def _colour_caption(self, folded: bool | None = None, merged: bool | None = None) -> str:
         """What the cell colours stand for, for the colour legend. Screen
@@ -1614,33 +1699,43 @@ class MatrixApp(tk.Tk):
             what = "crosslinks per cell"
         else:
             what = f"{_AGG_NAMES[self._agg_method]} of scores"
-        return f"{what} ({'by rank' if self._cmap_lut is not None else 'linear'})"
+        return f"{what} (quantiles)"
 
     def _legend_image(self, width: int, ref: np.ndarray, caption: str) -> Image.Image:
-        """A colour bar for the values in ref (sorted), as wide as `width`:
-        the caption, the bar, and the smallest, middle and largest value
-        under it. The bar uses the same colouring as the cells, so with a
-        colormap the middle is the median and without one the midpoint."""
+        """The colour scale for the values in ref (sorted), as wide as
+        `width`: the caption, one equally wide box per step, and under the
+        borders between the boxes the value where each step begins (a tick
+        at every border; a number only where it doesn't run into its
+        neighbours, the smallest and largest always). Every box holds the
+        same share of the values."""
         lh, font, pad = self._ch, self._pil_lf, 4
-        bar_h = 10
-        img = Image.new("RGB", (max(1, width), 2 * lh + bar_h + 4), _BG)
+        bar_h, tick = 10, 3
+        img = Image.new("RGB", (max(1, width), 2 * lh + bar_h + tick + 4), _BG)
         draw = ImageDraw.Draw(img)
         draw.text((pad, 0), caption, font=font, fill=_FG)
         bar_w = width - 2 * pad
-        if len(ref) == 0 or bar_w < 2:
+        if len(ref) == 0 or bar_w < COLOUR_STEPS:
             return img
-        frac = np.linspace(0, 1, bar_w)
-        if self._cmap_lut is not None:
-            values = ref[np.round(frac * (len(ref) - 1)).astype(np.int64)]
-        else:
-            values = ref[0] + frac * (ref[-1] - ref[0])
-        bar = np.broadcast_to(self._colours_for(values, ref), (bar_h, bar_w, 3))
-        img.paste(Image.fromarray(np.ascontiguousarray(bar)), (pad, lh + 1))
-        draw.rectangle([pad, lh + 1, pad + bar_w - 1, lh + bar_h], outline=_SEP)
-        y = lh + bar_h + 3
-        for k, anchor in ((0, "la"), (len(values) // 2, "ma"), (len(values) - 1, "ra")):
-            x = pad + (k if anchor != "ma" else bar_w // 2)
-            draw.text((x, y), f"{values[k]:.3g}", font=font, anchor=anchor, fill=_FG)
+        top, bottom = lh + 1, lh + bar_h
+        xs = [pad + round(k * (bar_w - 1) / COLOUR_STEPS) for k in range(COLOUR_STEPS + 1)]
+        for k, colour in enumerate(self._step_colours().tolist()):
+            draw.rectangle([xs[k], top, xs[k + 1], bottom], fill=tuple(colour), outline=_SEP)
+        y = bottom + tick + 1
+        texts = [f"{v:.3g}" for v in self._step_edges(ref).tolist()]
+        gap = 6   # at least this much room between two numbers
+        last_left = xs[-1] - font.getlength(texts[-1])
+        draw.text((xs[-1], y), texts[-1], font=font, anchor="ra", fill=_FG)
+        right = -math.inf   # where the last number written ends
+        for k, x in enumerate(xs):
+            draw.line([(x, bottom), (x, bottom + tick)], fill=_SEP)
+            if k == len(xs) - 1:
+                break
+            half = font.getlength(texts[k]) / 2
+            left = x if k == 0 else x - half
+            end = x + 2 * half if k == 0 else x + half
+            if left >= right + gap and end <= last_left - gap:
+                draw.text((x, y), texts[k], font=font, anchor="la" if k == 0 else "ma", fill=_FG)
+                right = end
         return img
 
     def _update_legend(self) -> None:
@@ -1650,6 +1745,10 @@ class MatrixApp(tk.Tk):
         img = self._legend_image(SIDEBAR_W - 40, self._colour_ref, self._colour_caption())
         self._legend_photo = ImageTk.PhotoImage(img)
         self._legend.configure(image=self._legend_photo, height=img.height)
+        # the score distribution gets the colours that cells with those
+        # scores get (by score, also while the cells show counts)
+        rgb = self._colours_for(self._cutoff_slider.bin_centres(), self._cutoff_scores())
+        self._cutoff_slider.set_bin_colours([_rgb_hex(c) for c in rgb.tolist()])
 
     @staticmethod
     def _cell_text(score: float, cell_px: int) -> str | None:
@@ -1659,8 +1758,8 @@ class MatrixApp(tk.Tk):
     # -------------------------------------------------------------------------
     # Score cutoff
     #
-    # Cells whose score is outside the chosen range are hidden. The colours
-    # don't change, so a score always has the same colour.
+    # Cells whose score is outside the chosen range are hidden, and the
+    # colour scale is spread over the range that is left (see Colours).
     # -------------------------------------------------------------------------
 
     def _in_cutoff(self, score: float) -> bool:
@@ -1854,16 +1953,62 @@ class MatrixApp(tk.Tk):
         return runs
 
     def _find_zoom_min(self) -> int:
-        """The lowest zoom slider value: at least BLOCK_ZOOM_STEPS below
-        CELL_PX_MIN, and further for big matrices, until the whole matrix
-        fits into ZOOM_OUT_FIT_PX or blocks can't get any bigger (one block
-        for the targets and one for the decoys)."""
+        """The lowest zoom slider value. Zooming out stops as soon as the
+        whole matrix is visible at once (but it can always go down to
+        CELL_PX_DEFAULT). If the view is too small for that, at least
+        BLOCK_ZOOM_STEPS below CELL_PX_MIN, and further for big matrices,
+        until the whole matrix fits into ZOOM_OUT_FIT_PX or blocks can't
+        get any bigger (one block for the targets and one for the decoys)."""
         n = len(self._slots)
         longest = max(self._split, n - self._split, 1)
         v = CELL_PX_MIN - BLOCK_ZOOM_STEPS
         while self._extent_px(v, 0, n) > ZOOM_OUT_FIT_PX and self._block_size_for(v) < longest:
             v -= 1
-        return v
+        if self._mx.winfo_width() <= 1:
+            return v   # the window isn't on screen yet, so nothing can be measured
+        full_w, full_h = self._view_area()
+        fitting = next((u for u in range(CELL_PX_MAX, v - 1, -1)
+                        if self._fits_view(u, 0, n, 0, n, full_w, full_h)), v)
+        return min(fitting, CELL_PX_DEFAULT)
+
+    def _schedule_zoom_min(self) -> None:
+        """The view changed size: work out the zoom cap again, once things
+        have settled (showing or hiding the labels resizes the view too)."""
+        if not self._zoom_min_pending:
+            self._zoom_min_pending = True
+            self.after_idle(self._update_zoom_min)
+
+    def _update_zoom_min(self) -> None:
+        """Apply the zoom cap (see _find_zoom_min) to the slider and, if
+        the view is zoomed out further than that, to the view."""
+        self._zoom_min_pending = False
+        if not self._slots:
+            return
+        self._zoom_min = self._find_zoom_min()
+        self._zoom.configure(from_=self._zoom_min)
+        if self._zoom_value < self._zoom_min:
+            self._on_zoom(str(self._zoom_min))
+            self._zoom.set(self._zoom_min)
+
+    def _view_area(self) -> tuple[int, int]:
+        """The room for the matrix and the labels together."""
+        full_w, full_h = self._mx.winfo_width(), self._mx.winfo_height()
+        if not self._headers_hidden:
+            full_w, full_h = full_w + self._label_w, full_h + self._header_h
+        return full_w, full_h
+
+    def _fits_view(self, v: int, r0: int, r1: int, c0: int, c1: int,
+                   full_w: int, full_h: int) -> bool:
+        """Whether rows r0:r1 and columns c0:c1 fit into the view at zoom
+        slider value v. The labels of that zoom take their room, and zoomed
+        out into blocks also the padding."""
+        overview = v < CELL_PX_MIN
+        label_w, _, header_h = self._label_sizes(overview)
+        if not self._headers_shown(overview):
+            label_w = header_h = 0
+        pad = 2 * OVERVIEW_PAD_PX if overview else 0
+        fw, fh = full_w - label_w - pad, full_h - header_h - pad
+        return self._extent_px(v, c0, c1) <= fw and self._extent_px(v, r0, r1) <= fh
 
     def _zoom_region(self, target: str) -> tuple[int, int, int, int] | None:
         """The items (row start, row end, column start, column end) that
@@ -1888,24 +2033,10 @@ class MatrixApp(tk.Tk):
         if target != "All" and not self._quad_shown[target]:
             self._quad_vars[target].set(True)   # the trace redraws with it shown
         r0, r1, c0, c1 = region
-        # the whole area, with the labels if they are shown right now
-        full_w, full_h = self._mx.winfo_width(), self._mx.winfo_height()
-        if not self._headers_hidden:
-            full_w, full_h = full_w + self._label_w, full_h + self._header_h
-
-        def fits(v: int) -> bool:
-            # what's left for the matrix at zoom v: the labels of that zoom
-            # take their room, and zoomed out into blocks also the padding
-            overview = v < CELL_PX_MIN
-            label_w, _, header_h = self._label_sizes(overview)
-            if not self._headers_shown(overview):
-                label_w = header_h = 0
-            pad = 2 * OVERVIEW_PAD_PX if overview else 0
-            fw, fh = full_w - label_w - pad, full_h - header_h - pad
-            return self._extent_px(v, c0, c1) <= fw and self._extent_px(v, r0, r1) <= fh
-
+        full_w, full_h = self._view_area()
         # the biggest zoom at which the region still fits
-        v = next((v for v in range(CELL_PX_MAX, self._zoom_min - 1, -1) if fits(v)), self._zoom_min)
+        v = next((v for v in range(CELL_PX_MAX, self._zoom_min - 1, -1)
+                  if self._fits_view(v, r0, r1, c0, c1, full_w, full_h)), self._zoom_min)
         self._on_zoom(str(v))
         self._zoom.set(v)
         w, h = self._mx.winfo_width(), self._mx.winfo_height()
@@ -1963,9 +2094,69 @@ class MatrixApp(tk.Tk):
         self._blocks = blocks
         self._item_to_block = [bi for bi, (s, e) in enumerate(blocks) for _ in range(s, e)]
         self._split_block = self._item_to_block[split] if 0 <= split < n else len(blocks)
+        self._border_pos, self._border_level = self._find_borders([s for s, _ in blocks])
         self._block_tracks = self._tracks_per_block()
         self._group_links()
         self._reduce_block_scores()
+
+    def _find_borders(self, first_slots: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        """Where one open group or protein ends and the next begins, so the
+        layers of an opened axis can be told apart in the matrix. Position k
+        stands for slot first_slots[k]. Returns the positions k with a
+        border between k-1 and k, and for each the level of the tree that
+        changes there (0 = the biggest groups)."""
+        pos, levels = [], []
+        for k in range(1, len(first_slots)):
+            a, b = self._slot_paths[first_slots[k - 1]], self._slot_paths[first_slots[k]]
+            common = min(len(a), len(b))
+            level = next((i for i in range(common) if a[i] is not b[i]), common)
+            if level < max(len(a), len(b)):   # not two slots right under the same node
+                pos.append(k)
+                levels.append(level)
+        return np.array(pos, dtype=np.int64), np.array(levels, dtype=np.int64)
+
+    def _track_tints(self, masks: np.ndarray) -> np.ndarray:
+        """For every position: how much of white is left in each colour
+        channel (0 to 1) after the annotations there tinted it. masks is
+        (feature type, position) as in _slot_tracks."""
+        tint = np.ones((masks.shape[1], 3))
+        for t, kind in enumerate(self._shown_features):
+            colour = np.array(_hex_rgb(_FEATURE_COLOURS[kind])) / 255
+            m = masks[t]
+            tint[m] = tint[m] * (1 - TRACK_TINT) + colour * TRACK_TINT
+        return tint
+
+    def _background(self, row_masks: np.ndarray, col_masks: np.ndarray) -> np.ndarray | None:
+        """The matrix background (rows x columns x RGB): white, with the
+        annotated rows and columns tinted in the feature colours. None
+        while no annotations are shown."""
+        if not self._shown_features or not row_masks.size or not (row_masks.any() or col_masks.any()):
+            return None
+        rows, cols = self._track_tints(row_masks), self._track_tints(col_masks)
+        return np.round(255 * rows[:, None, :] * cols[None, :, :]).astype(np.uint8)
+
+    def _paint_lines(self, frame: np.ndarray, starts: np.ndarray, levels: np.ndarray,
+                     split: int | None, cp: int, ox: int, oy: int,
+                     box: tuple[int, int, int, int]) -> None:
+        """Draw the lines through the matrix into an RGB array: a thin line
+        at every border between open groups/proteins (darker for bigger
+        groups), and the thick target/decoy line on top. Position k starts
+        at pixel k * cp - ox across and k * cp - oy down; box is the part
+        of the array the matrix covers (left, top, right, bottom)."""
+        x0, y0, x1, y1 = box
+        if x0 >= x1 or y0 >= y1:
+            return
+        for level in sorted(set(levels.tolist()), reverse=True):   # the biggest groups last, on top
+            colour = _LAYER_LINES[min(level, len(_LAYER_LINES) - 1)]
+            at = starts[levels == level] * cp
+            xs, ys = at - ox, at - oy
+            frame[y0:y1, xs[(xs >= x0) & (xs < x1)]] = colour
+            frame[ys[(ys >= y0) & (ys < y1)], x0:x1] = colour
+        if split is not None:
+            half = SPLIT_PX // 2
+            sx, sy = split * cp - ox, split * cp - oy
+            frame[y0:y1, max(x0, sx - half):max(x0, min(x1, sx - half + SPLIT_PX))] = _SPLIT
+            frame[max(y0, sy - half):max(y0, min(y1, sy - half + SPLIT_PX)), x0:x1] = _SPLIT
 
     def _group_links(self) -> None:
         """Sort every visible crosslink into its cell (row block of Protein1,
@@ -2000,7 +2191,7 @@ class MatrixApp(tk.Tk):
             # coloured by their rank among the values on screen
             self._colour_ref = np.sort(self._cell_scores)
         else:
-            self._colour_ref = self._score_sorted
+            self._colour_ref = self._cutoff_scores()   # the scale spans the cutoff
         self._cell_rgb = self._colours_for(self._cell_scores)
         self._update_legend()
 
@@ -2243,13 +2434,21 @@ class MatrixApp(tk.Tk):
     def _matrix_pixels(self, w: int, h: int) -> np.ndarray:
         """The visible part of the matrix as an RGB array of w x h pixels.
         The cells are first painted with a single pixel each and then blown
-        up to the cell size. That's much faster than painting them one by one."""
+        up to the cell size. That's much faster than painting them one by one.
+        Annotated rows and columns are tinted underneath the cells, and the
+        lines between groups/proteins and between targets and decoys are
+        drawn on top."""
         cp = self._cell_px
         ox, oy = int(self._mx.canvasx(0)), int(self._mx.canvasy(0))
         rows, cols, r, c, _, rgb = self._visible_cells()
         frame = np.full((h, w, 3), 255, dtype=np.uint8)
         if len(rows) and len(cols):
             small = np.full((len(rows), len(cols), 3), 255, dtype=np.uint8)
+            tracks = self._block_tracks
+            if tracks.shape[1:] == (len(self._blocks),):
+                bg = self._background(tracks[:, rows.start:rows.stop], tracks[:, cols.start:cols.stop])
+                if bg is not None:
+                    small[:] = bg
             small[r - rows.start, c - cols.start] = rgb
             big = small.repeat(cp, axis=0).repeat(cp, axis=1)
             # the first visible cell usually starts a little outside the canvas
@@ -2258,6 +2457,11 @@ class MatrixApp(tk.Tk):
             target = frame[max(0, y):, max(0, x):]
             ph, pw = min(len(part), len(target)), min(part.shape[1], target.shape[1])
             target[:ph, :pw] = part[:ph, :pw]
+        n = len(self._blocks)
+        bx0, by0, bx1, by1 = self._matrix_box()
+        split = self._split_block if 0 < self._split_block < n else None
+        self._paint_lines(frame, self._border_pos, self._border_level, split, cp, ox, oy,
+                          (max(0, bx0), max(0, by0), min(w, bx1), min(h, by1)))
         return frame
 
     def _score_texts(self):
@@ -2299,23 +2503,16 @@ class MatrixApp(tk.Tk):
         screen, cp = self._pg_frame, self._cell_px
         _pygame.surfarray.blit_array(screen, self._matrix_pixels(w, h).swapaxes(0, 1))
 
-        # cells with a score written into them are drawn on top, one by one
+        # the scores are written on top of the cells, one by one (only the
+        # text, so the lines through the matrix stay visible)
         for x, y, colour, text in self._score_texts():
-            surf = self._pg_cache.get((colour, text))
-            if surf is None:
-                surf = _pygame.Surface((cp, cp))
-                surf.fill(colour)
-                ts = self._pg_font.render(text, True, _auto_fg(colour), colour)
-                surf.blit(ts, ts.get_rect(center=(cp // 2, cp // 2)))
-                self._pg_cache[(colour, text)] = surf
-            screen.blit(surf, (x, y))
+            ts = self._pg_cache.get((colour, text))
+            if ts is None:
+                ts = self._pg_cache[(colour, text)] = self._pg_font.render(text, True, _auto_fg(colour))
+            screen.blit(ts, ts.get_rect(center=(x + cp // 2, y + cp // 2)))
 
-        sx, sy, sel = self._overlay_positions()
+        _, _, sel = self._overlay_positions()
         bx0, by0, bx1, by1 = self._matrix_box()
-        if sx is not None:
-            _pygame.draw.line(screen, _SEP, (sx, max(0, by0)), (sx, min(h, by1)))
-            if 0 <= sy <= h:
-                _pygame.draw.line(screen, _SEP, (max(0, bx0), sy), (min(w, bx1), sy))
         if self._overview:
             _pygame.draw.rect(screen, _SEP, (bx0 - 1, by0 - 1, bx1 - bx0 + 2, by1 - by0 + 2), 1)
         if sel is not None:
@@ -2333,12 +2530,8 @@ class MatrixApp(tk.Tk):
             mask, mx, my = self._text_mask(text)
             img.paste(_auto_fg(colour), (x + cp // 2 - mx, y + cp // 2 - my), mask)
 
-        sx, sy, sel = self._overlay_positions()
+        _, _, sel = self._overlay_positions()   # the lines are already in the pixels
         bx0, by0, bx1, by1 = self._matrix_box()
-        if sx is not None:
-            draw.line([(sx, max(0, by0)), (sx, min(h, by1))], fill=_SEP, width=1)
-            if 0 <= sy <= h:
-                draw.line([(max(0, bx0), sy), (min(w, bx1), sy)], fill=_SEP, width=1)
         if self._overview:
             draw.rectangle([bx0 - 1, by0 - 1, bx1, by1], outline=_SEP, width=1)
         if sel is not None:
@@ -2507,9 +2700,6 @@ class MatrixApp(tk.Tk):
         self._draw_bands(img, [s for s, _ in self._blocks], split, cp, -ox, "col")
         y = self._label_base   # the line under the names
 
-        if has_sep:
-            draw.line([(split * cp - ox, 0), (split * cp - ox, h)], fill=_SEP, width=1)
-
         if not self._names_shown(self._overview):
             pass   # zoomed out into blocks without residues: only the band names
         elif self._overview:
@@ -2540,8 +2730,9 @@ class MatrixApp(tk.Tk):
                     img.paste(_FG, (cb * cp + cp // 2 - ox - lx, y - LABEL_GAP_PX - ly), label)
 
         draw.line([(0, y), (w, y)], fill=_SEP, width=1)
-        if has_sep:
-            draw.text((split * cp - ox, y), "+", font=font, anchor="mm", fill=_SEP)
+        if has_sep:   # on top of the names, like in the matrix
+            sx = split * cp - ox - SPLIT_PX // 2
+            draw.rectangle([sx, 0, sx + SPLIT_PX - 1, h], fill=_SPLIT)
         if self._tracks_px:
             self._draw_tracks(draw, self._block_tracks, cols, cp, -ox, h - self._tracks_px, "col")
 
@@ -2589,8 +2780,9 @@ class MatrixApp(tk.Tk):
         if self._tracks_px:
             self._draw_tracks(draw, self._block_tracks, rows, cp, -oy, right, "row")
 
-        if 0 < split < n and 0 <= split * cp - oy <= h:
-            draw.line([(0, split * cp - oy), (w, split * cp - oy)], fill=_SEP, width=1)
+        if 0 < split < n:
+            sy = split * cp - oy - SPLIT_PX // 2
+            draw.rectangle([0, sy, w, sy + SPLIT_PX - 1], fill=_SPLIT)
 
         self._rl_photo = ImageTk.PhotoImage(img)
         c.delete("all")
@@ -2674,19 +2866,24 @@ class MatrixApp(tk.Tk):
             self._draw_tracks(draw, self._slot_tracks, every_slot, cp, lw, hh - tracks, "col")
             self._draw_tracks(draw, self._slot_tracks, every_slot, cp, hh, lw - tracks, "row")
 
-        # lines between targets and decoys
+        # the target/decoy line through the labels (through the matrix it
+        # comes after the cells)
         if has_sep:
-            sx, sy = lw + split * cp, hh + split * cp
-            draw.line([(0, sy), (lw, sy)], fill=_SEP, width=1)
-            draw.line([(sx, 0), (sx, matrix_bottom)], fill=_SEP, width=1)
-            draw.line([(lw, sy), (total_w, sy)], fill=_SEP, width=1)
+            sx, sy = lw + split * cp - SPLIT_PX // 2, hh + split * cp - SPLIT_PX // 2
+            draw.rectangle([0, sy, lw - 1, sy + SPLIT_PX - 1], fill=_SPLIT)
+            draw.rectangle([sx, 0, sx + SPLIT_PX - 1, hh - 1], fill=_SPLIT)
+
+        # annotated rows and columns tinted under the cells
+        bg = self._background(self._slot_tracks, self._slot_tracks) if tracks else None
+        if bg is not None:
+            img.paste(Image.fromarray(bg.repeat(cp, axis=0).repeat(cp, axis=1)), (lw, hh))
 
         # the cells themselves: every crosslink that is shown, or where a
         # cell holds several (folded, or a closed group or protein), their
         # combined value
         keep = self._shown_links()
         rows, cols, scores = self._link_rows[keep], self._link_cols[keep], self._link_scores[keep]
-        ref = self._score_sorted   # what the colours are measured against
+        ref = self._cutoff_scores()   # what the colours are measured against, like on screen
         if self._folded or not self._uniform:
             rows, cols, grouped, starts = _group_cells(rows, cols, scores, max(1, n), self._folded)
             scores = _aggregate_groups(grouped, starts, self._agg_method)
@@ -2703,6 +2900,15 @@ class MatrixApp(tk.Tk):
                 draw.text((x0 + cp // 2, y0 + cp // 2), text, font=font_cell, anchor="mm",
                           fill=_auto_fg(colour))
 
+        # the lines between groups/proteins and between targets and decoys
+        if n:
+            box = (lw, hh, lw + n * cp, hh + n * cp)
+            part = np.array(img.crop(box))
+            starts, levels = self._find_borders(every_slot)
+            self._paint_lines(part, starts, levels, split if has_sep else None, cp, 0, 0,
+                              (0, 0, n * cp, n * cp))
+            img.paste(Image.fromarray(part), box[:2])
+
         # what the colours mean, under the matrix
         caption = self._colour_caption(folded=self._folded, merged=not self._uniform)
         img.paste(self._legend_image(legend_w, ref, caption), (4, matrix_bottom + 8))
@@ -2714,7 +2920,27 @@ class MatrixApp(tk.Tk):
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    MatrixApp(sys.argv[1] if len(sys.argv) > 1 else None).mainloop()
+    parser = argparse.ArgumentParser(
+        description="XL-MS matrix viewer. Without --csv or --uuid a file "
+                    "dialog asks for the CSV.")
+    add_data_args(parser, required=False)
+    args = parser.parse_args()
+    if not (args.csv or args.uuid):
+        # a short-lived hidden window, only for the file dialog
+        root = tk.Tk()
+        root.withdraw()
+        args.csv = filedialog.askopenfilename(
+            title="Open crosslink CSV", filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if args.csv and not args.fasta:
+            # optional: cancelling this one just means no sequences
+            args.fasta = filedialog.askopenfilename(
+                title="Open FASTA with the protein sequences (optional, Cancel to skip)",
+                initialdir=os.path.dirname(args.csv),
+                filetypes=[("FASTA", "*.fasta *.fa *.faa"), ("All", "*.*")]) or None
+        root.destroy()
+        if not args.csv:
+            return   # cancelled
+    MatrixApp(args).mainloop()
 
 
 if __name__ == "__main__":

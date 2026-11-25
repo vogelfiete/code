@@ -1,7 +1,8 @@
-"""Turn a crosslink CSV into a protein-protein (or residue-residue) matrix
-and print it to the console as a grid of dots.
+"""Turn crosslinks (from a CSV file or the crosslinking API) into a
+protein-protein (or residue-residue) matrix and print it to the console as a
+grid of dots.
 
-The work happens in three steps: build the matrix from the CSV, put the axes
+The work happens in three steps: build the matrix from the crosslinks, put the axes
 into a useful order, then print it. The GUI (gui/matrix_app.py) reuses the
 first two steps and only draws the result differently.
 See docs/usage.md for the full command line reference."""
@@ -23,8 +24,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from data_source import add_data_args, load_data
 from fetch_group_order import complex_hierarchy, order_by_go_complex, short_accession
-from xlms.io import read_fasta
 
 
 # -----------------------------------------------------------------------------
@@ -239,7 +240,10 @@ def _classify_proteins(
 # -----------------------------------------------------------------------------
 # Building the matrix
 #
-# We go through the CSV from the best score to the worst and collect proteins
+# The crosslinks come as a table with the columns of a crosslink CSV (see
+# data_source.py for where it is loaded from).
+#
+# We go through the table from the best score to the worst and collect proteins
 # (or residues) until we have N of them. Then we go through it once more and
 # keep the best score for every pair among those items.
 #
@@ -247,7 +251,7 @@ def _classify_proteins(
 # "B,A" lands in row B, column A. The two are never merged.
 # -----------------------------------------------------------------------------
 
-def build_matrix(path: str, n: int | None = DEFAULT_N):
+def build_matrix(table: pd.DataFrame, n: int | None = DEFAULT_N):
     """Build the protein-level matrix. Returns (proteins, sparse, is_decoy):
         proteins — the N most confident protein names (all if n is None), targets first, then decoys, each group in
                    order of confidence
@@ -255,17 +259,16 @@ def build_matrix(path: str, n: int | None = DEFAULT_N):
                    same order as in the CSV row
         is_decoy — {protein: True/False}
     """
-    return _build(path, n, level="protein")
+    return _build(table, n, level="protein")
 
 
-def build_residue_matrix(path: str, n: int | None = DEFAULT_N):
+def build_residue_matrix(table: pd.DataFrame, n: int | None = DEFAULT_N):
     """Same as build_matrix, but every row and column is a single residue.
-    The CSV needs residue position columns for this."""
-    return _build(path, n, level="residue")
+    The table needs residue position columns for this."""
+    return _build(table, n, level="residue")
 
 
-def _build(path: str, n: int | None, level: str):
-    df = pd.read_csv(path)
+def _build(df: pd.DataFrame, n: int | None, level: str):
     lower = {c.lower(): c for c in df.columns}
     missing = [c for c in ("protein1", "protein2", "score") if c not in lower]
     if missing:
@@ -657,7 +660,7 @@ def _sparse_size_bytes(sparse: dict[tuple, float]) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Print XL-MS adjacency matrix")
-    parser.add_argument("csv", help="Path to the crosslink CSV file")
+    add_data_args(parser)
     parser.add_argument("--level", choices=["protein", "residue"], default="protein",
                         help="Axis granularity: protein (default) or residue "
                              "(requires residue-position columns in the CSV)")
@@ -666,26 +669,23 @@ def main() -> None:
     parser.add_argument("--order", choices=ORDER_MODES, default="confidence",
                         help="Axis ordering: confidence (default), alpha, sequence, "
                              "complex (GO cellular component), size (longest sequence first)")
-    parser.add_argument("--fasta", default=None,
-                        help="FASTA file path (required for --order sequence; in residue "
-                             "mode it also adds the residues without crosslinks)")
     parser.add_argument("--locations", action="store_true",
                         help="With --order complex: group proteins without a complex by "
                              "their cellular location instead of putting them in Unknown")
     args = parser.parse_args()
 
-    if args.order == "sequence" and not args.fasta:
-        parser.error("--fasta is required when --order sequence")
+    if args.order == "sequence" and not (args.fasta or args.uuid):
+        parser.error("--order sequence needs sequences: give --fasta (or use --uuid)")
 
     residue_level = args.level == "residue"
     tracemalloc.start()
     try:
+        table, sequences = load_data(args)
         build = build_residue_matrix if residue_level else build_matrix
-        items, sparse, is_decoy = build(args.csv, n=args.n)
+        items, sparse, is_decoy = build(table, n=args.n)
     except ValueError as exc:
         parser.error(str(exc))
 
-    sequences = read_fasta(args.fasta) if args.fasta else None
     if residue_level:
         if sequences:
             # with a FASTA, every residue of the loaded proteins is shown,

@@ -15,7 +15,6 @@ scipy>=1.10          # (1.18.1) for the "sequence" ordering
 biopython>=1.81      # (1.88)   for reading FASTA files
 Pillow>=10.1         # (12.3.0) for drawing the GUI and the PNG export
 
-# Optional, but recommended. Without matplotlib the GUI only has greyscale
-# cells; without pygame it draws with numpy/PIL, which is a bit slower.
-matplotlib>=3.7      # (3.11.2)
+# Optional, but recommended. Without pygame the GUI draws with numpy/PIL,
+# which is a bit slower.
 pygame>=2.5          # (2.6.1)

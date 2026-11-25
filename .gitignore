@@ -5,3 +5,6 @@
 /java
 /Python
 /websites
+__pycache__/
+*.py[cod]
+venv/

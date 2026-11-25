@@ -7,8 +7,8 @@ as an interactive GUI.
 ## Setup
 
 The project expects Python 3.11+ with `pandas`, `biopython`, `scipy`, `numpy`
-and `Pillow` installed. `matplotlib` and `pygame` are optional — without them
-the GUI falls back to greyscale cells and CPU-only (numpy) rendering. All of
+and `Pillow` installed. `pygame` is optional — without it the GUI falls back
+to CPU-only (numpy) rendering. All of
 them are listed in `requirements.txt`. From the `Bachelorarbeit` folder:
 
 **Windows**
@@ -178,16 +178,25 @@ python scripts/print_matrix.py residues.csv --level residue
 ## GUI: `gui/matrix_app.py`
 
 ```
-python gui/matrix_app.py [csv_path]
+python gui/matrix_app.py --csv data/links.csv [--fasta data/proteins.fasta]
+python gui/matrix_app.py --uuid <result set> [<result set> …]
 ```
+
+The data options are the same as for the CLI (`--csv` or `--uuid`,
+`--fasta`, `--api`, `--min-score`, `--sample`, `--seed`); the data is read
+once at the start. Started without `--csv` or `--uuid`, the GUI asks for
+the CSV in a file dialog, then for a FASTA file (optional: Cancel skips it,
+and a `--fasta` given on the command line is used instead of asking).
 
 Opens a Tkinter window. All controls sit in a panel on the left, so the
 matrix uses the full window height; the panel scrolls (mouse wheel over it)
 if the window is too short to show everything. The panel has four groups:
 
-**Data** — the same CSV/FASTA/`--order` options as the CLI, the **Group
+**Data** — where the data comes from, **Order** (`--order`) and the **Group
 rest by location** checkbox (`--locations`, only shown for the `complex`
-order), plus **Load**, **Export PNG…** and the load status. Unlike the CLI
+order), plus **Export PNG…** and the load status. Order and the checkbox
+take effect right away: the matrix is sorted again, and what is open, the
+cutoff and the zoom stay as they were. Unlike the CLI
 there is no `--n` and no `--level`: the GUI always loads all proteins and,
 if the CSV has residue-position columns, all their residues too, and starts
 at protein level (see *The axis tree* below). With a FASTA file, every
@@ -210,7 +219,10 @@ ribosomal subunit*); every protein holds its residues. Rows and columns
 always show the same nodes. Each open group or protein gets a band with its
 name above the columns and, turned to read bottom to top, left of the row
 labels — one band row per level — so links between two groups can be read
-off from both axes.
+off from both axes. Thin grey lines run through the matrix wherever one
+open group or protein ends and the next begins, darker for bigger groups,
+so the layers stay apart. The line between targets and decoys is thicker
+and dark, so the quadrants can always be told apart.
 
 - **Click a name** (a column header or a row label) to open it: a protein
   opens into its residues, a closed group (written `+name`) into what it
@@ -234,20 +246,22 @@ the visible part.
 
 **Display**
 
-- **Colormap** — `(none)` for greyscale, or a matplotlib colormap (e.g.
-  `coolwarm`) if matplotlib is installed.
-  With a colormap, the colour follows the rank of a score among all scores
-  (quantile), so the colours are spread evenly even when most scores lie
-  close together.
-  The colour legend under **Fold** shows what the colours mean right now:
-  what a cell holds (score, an Aggregate of scores, or crosslinks per cell),
-  whether colours follow the rank or are linear, and the smallest, middle
-  and largest value.
+- **Colours** — the cells use the 10 colours of ColorBrewer's diverging
+  *RdBu* scheme (<https://colorbrewer2.org/?type=diverging&scheme=RdBu&n=10>),
+  dark blue for the lowest scores to dark red for the highest. Each colour
+  is a quantile: the lowest tenth of the scores gets the first colour, the
+  next tenth the second, and so on, so every colour stands for the same
+  share of the scores even when most scores lie close together. The
+  quantiles are taken over the scores inside the **Score cutoff**:
+  narrowing the cutoff spreads all the colours over the scores that are
+  left. The colour legend under **Fold** shows what the colours mean right
+  now: what a cell holds (score, an Aggregate of scores, or crosslinks per
+  cell), one box per colour, and the score where each step begins.
 - **Zoom** — cell size in pixels; from 18 px on, cells show the numeric
   score. Zooming below 4 px merges neighbouring items into blocks. The
-  slider zooms around the middle of the view. Big matrices (e.g. residue
-  level) get extra zoom steps, so the whole matrix can be zoomed out to
-  about 200 px. Blocks never cross the target/decoy line. Runs of nodes
+  slider zooms around the middle of the view. Zooming out stops as soon as
+  the whole matrix is visible at once (it can always go down to 10 px).
+  Blocks never cross the target/decoy line. Runs of nodes
   under the same group or protein smaller than a block are packed into one
   block whole; bigger ones are cut into several blocks. While zoomed out
   into blocks, the single item names are hidden (they can't be read at that
@@ -298,20 +312,22 @@ colour (shown next to its checkbox). The features of all loaded proteins
 are fetched in the background the first time a type is ticked, and cached
 in `~/.cache/xlms_matrix/uniprot/features.json`. Tracks only appear while
 residues are on the axes; zoomed out into blocks, a block is coloured if
-any of its residues has the feature. Clicking a residue cell lists the
-features it lies in under Selection.
+any of its residues has the feature. Inside the matrix, every annotated
+residue row and column is tinted faintly in the feature's colour, as a band
+under the cells. Clicking a residue cell lists the features it lies in
+under Selection.
 
 **Score cutoff** — one slider with two handles: the left handle is the
 bottom limit, the right handle the top limit (both inclusive). Cells whose
 score is outside the range are hidden; they are also left out of block
-aggregates and of the PNG export. Colours keep the full-range scale, so a
-score has the same colour whatever the cutoff. Above the slider, on the same
-score scale, a plot shows how the scores of the crosslinks on the axes are
-spread: targets (TT) as blue bars, decoys (TD, DT, DD) as an orange line,
-on a logarithmic count scale; only the quadrants that are switched on count,
-and bins outside the cutoff turn grey. The label shows the range and how
-many links are visible; **Reset** restores the full range. Loading new data
-resets the cutoff.
+aggregates and of the PNG export. The colour scale spans only the range
+inside the cutoff (see **Colours**). Above the slider, on the same score
+scale, a plot shows how the scores of the crosslinks on the axes are
+spread: targets (TT) as bars in the colours their cells get (like the
+legend), decoys (TD, DT, DD) as an orange line, on a logarithmic count
+scale; only the quadrants that are switched on count, and bins outside the
+cutoff are only outlined. The label shows the range and how many links are
+visible; **Reset** restores the full range.
 
 **Moving around** — the matrix works like a map. Turn the mouse wheel over
 it (or over the column headers or row labels) to zoom in and out; the spot
